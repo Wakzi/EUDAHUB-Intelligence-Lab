@@ -1,0 +1,302 @@
+name: Pipeline EUDAMED EU - DK Subset
+
+on:
+#  schedule:
+#    - cron: "0 2 */3 * *"
+#    - cron: "0 2 1 * *"
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "partitioned"
+        type: choice
+        options:
+          - partitioned
+          - unfiltered
+          - partitioned_nextlink
+          - unfiltered_nextlink
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eudamed-pipeline
+  cancel-in-progress: false
+
+jobs:
+  fetch-eudamed:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout ETL repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate release date
+        id: timestamp
+        run: |
+          echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+          echo "date_compact=$(date +'%Y%m%d_%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Download latest EUDAMED state database
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          mkdir -p previous_state
+
+          echo "Trying latest release tag: eudamed-latest"
+
+          gh release download eudamed-latest \
+            --repo Wakzi/EUDAHUB-Intelligence-Data \
+            --pattern "eudamed.duckdb" \
+            --dir previous_state \
+            --clobber || true
+
+          if [ ! -f previous_state/eudamed.duckdb ]; then
+            echo "Latest release missing. Falling back to dated release: eudamed-20260519_070536"
+
+            gh release download eudamed-20260519_070536 \
+              --repo Wakzi/EUDAHUB-Intelligence-Data \
+              --pattern "eudamed.duckdb" \
+              --dir previous_state \
+              --clobber || true
+          fi
+
+          if [ -f previous_state/eudamed.duckdb ]; then
+            cp previous_state/eudamed.duckdb eudamed_latest.duckdb
+            echo "OK restored previous state DB"
+            ls -lh eudamed_latest.duckdb
+          else
+            echo "WARNING no previous state DB found"
+          fi
+
+      - name: Inspect latest state database
+        run: |
+          python - <<'PY'
+          import os
+          import duckdb
+
+          state_db = "eudamed_latest.duckdb"
+          print("state exists:", os.path.exists(state_db))
+
+          if os.path.exists(state_db):
+              print("state size:", os.path.getsize(state_db))
+              con = duckdb.connect(state_db, read_only=True)
+              print("tables:", con.execute("SHOW TABLES").fetchall())
+
+              for table in [
+                  "reference",
+                  "actors",
+                  "udi",
+                  "reference_change_events",
+                  "actors_change_events",
+                  "udi_change_events",
+                  "actor_dk_intel",
+                  "udi_dk_intel",
+                  "udi_dk_intel_change_events",
+              ]:
+                  try:
+                      row_count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                      print(f"{table}: {row_count:,} rows")
+                  except Exception as e:
+                      print(f"{table}: ERROR -> {e}")
+
+              con.close()
+          PY
+
+      - name: Download latest nextLink database from ETL repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download eudamed-nextlinks-latest \
+            --pattern "eudamed_nextlinks.duckdb" \
+            --clobber || true
+
+      - name: Choose run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.schedule }}" = "0 2 1 * *" ]; then
+            echo "mode=unfiltered" >> $GITHUB_OUTPUT
+          else
+            echo "mode=partitioned" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run EUDAMED pipeline
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python -u pipelines/eudamed/pipeline_eudamed_eu.py \
+            --mode ${{ steps.mode.outputs.mode }}
+
+      - name: List generated release assets
+        run: |
+          ls -lh
+
+      - name: Create or update dated release in data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TAG="eudamed-${{ steps.timestamp.outputs.date_compact }}"
+          TITLE="EUDAMED Data - ${{ steps.timestamp.outputs.date }}"
+          REPO="Wakzi/EUDAHUB-Intelligence-Data"
+
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES.md \
+              --latest=false
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES.md \
+              --latest=false
+          fi
+
+          for asset in \
+            eudamed.duckdb \
+            actor_dk_intel.csv \
+            udi_dk_intel.csv \
+            udi_dk_intel_change_events.csv \
+            actor_dk_intel_summary.csv \
+            top10_dk_manufacturers.csv \
+            top10_dk_authorised_representatives.csv \
+            eudamed_insights_summary.json \
+            eudamed_dk_exports.zip \
+            run_stats.json \
+            RELEASE_NOTES.md
+          do
+            gh release delete-asset "$TAG" "$asset" \
+              --repo "$REPO" \
+              --yes || true
+          done
+
+          gh release upload "$TAG" \
+            eudamed.duckdb \
+            actor_dk_intel.csv \
+            udi_dk_intel.csv \
+            udi_dk_intel_change_events.csv \
+            actor_dk_intel_summary.csv \
+            top10_dk_manufacturers.csv \
+            top10_dk_authorised_representatives.csv \
+            eudamed_insights_summary.json \
+            eudamed_dk_exports.zip \
+            run_stats.json \
+            RELEASE_NOTES.md \
+            --repo "$REPO" \
+            --clobber
+
+      - name: Create or update EUDAMED latest release in data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TAG="eudamed-latest"
+          TITLE="Latest EUDAMED Data"
+          REPO="Wakzi/EUDAHUB-Intelligence-Data"
+
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES.md \
+              --latest=false
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES.md \
+              --latest=false
+          fi
+
+          for asset in \
+            eudamed.duckdb \
+            actor_dk_intel.csv \
+            udi_dk_intel.csv \
+            udi_dk_intel_change_events.csv \
+            actor_dk_intel_summary.csv \
+            top10_dk_manufacturers.csv \
+            top10_dk_authorised_representatives.csv \
+            eudamed_insights_summary.json \
+            eudamed_dk_exports.zip \
+            run_stats.json \
+            RELEASE_NOTES.md
+          do
+            gh release delete-asset "$TAG" "$asset" \
+              --repo "$REPO" \
+              --yes || true
+          done
+
+          gh release upload "$TAG" \
+            eudamed.duckdb \
+            actor_dk_intel.csv \
+            udi_dk_intel.csv \
+            udi_dk_intel_change_events.csv \
+            actor_dk_intel_summary.csv \
+            top10_dk_manufacturers.csv \
+            top10_dk_authorised_representatives.csv \
+            eudamed_insights_summary.json \
+            eudamed_dk_exports.zip \
+            run_stats.json \
+            RELEASE_NOTES.md \
+            --repo "$REPO" \
+            --clobber
+
+      - name: Create or update nextLink release in ETL repo
+        if: steps.mode.outputs.mode == 'partitioned_nextlink' || steps.mode.outputs.mode == 'unfiltered_nextlink'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="eudamed-nextlinks-latest"
+          TITLE="Latest EUDAMED NextLinks"
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "$TITLE" \
+              --notes-file NEXTLINK_RELEASE_NOTES.md \
+              --latest=false
+          else
+            gh release create "$TAG" \
+              --title "$TITLE" \
+              --notes-file NEXTLINK_RELEASE_NOTES.md \
+              --latest=false
+          fi
+
+          for asset in \
+            eudamed_nextlinks.duckdb \
+            NEXTLINK_RELEASE_NOTES.md
+          do
+            gh release delete-asset "$TAG" "$asset" \
+              --yes || true
+          done
+
+          gh release upload "$TAG" \
+            eudamed_nextlinks.duckdb \
+            NEXTLINK_RELEASE_NOTES.md \
+            --clobber
+
+      - name: Upload workflow debug artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eudamed-${{ steps.mode.outputs.mode }}-${{ steps.timestamp.outputs.date_compact }}
+          path: |
+            RELEASE_NOTES.md
+            run_stats.json
+            NEXTLINK_RELEASE_NOTES.md
+          retention-days: 30
