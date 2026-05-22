@@ -380,9 +380,57 @@ def attached_table_exists(
         return False
 
 
-def get_table_columns(con: duckdb.DuckDBPyConnection, table_name: str) -> list[str]:
-    return [row[0] for row in con.execute(f"DESCRIBE {q(table_name)}").fetchall()]
+def get_table_columns(con, table_name, schema_name=None):
+    """
+    Return column names for a DuckDB table.
 
+    Supports:
+    - Main database tables
+    - Attached databases/schemas
+      Example:
+          get_table_columns(con, "actor_dk_intel")
+          get_table_columns(con, "actor_dk_intel", schema_name="state_db")
+    """
+
+    try:
+        if schema_name:
+            rows = con.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = ?
+                  AND table_name = ?
+                ORDER BY ordinal_position
+                """,
+                [schema_name, table_name],
+            ).fetchall()
+        else:
+            rows = con.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = ?
+                ORDER BY ordinal_position
+                """,
+                [table_name],
+            ).fetchall()
+
+        columns = [r[0] for r in rows]
+
+        if not columns:
+            print(
+                f"WARNING get_table_columns: no columns found for "
+                f"{schema_name + '.' if schema_name else ''}{table_name}"
+            )
+
+        return columns
+
+    except Exception as e:
+        print(
+            f"ERROR get_table_columns failed for "
+            f"{schema_name + '.' if schema_name else ''}{table_name}: {e}"
+        )
+        return []
 
 def get_attached_table_columns(
     con: duckdb.DuckDBPyConnection,
