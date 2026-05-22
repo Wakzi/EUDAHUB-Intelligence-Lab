@@ -1,0 +1,215 @@
+{
+  "actors_parameters": {
+    "request_parameter": "ACTOR_TYPE",
+    "type": "string",
+    "active": true,
+    "parameter_values": [
+      {
+        "id": "Authorised Representative",
+        "value": "Authorised Representative",
+        "active": true
+      },
+      {
+        "id": "Competent Authority",
+        "value": "Competent Authority",
+        "active": true
+      },
+      {
+        "id": "European Commission",
+        "value": "European Commission",
+        "active": true
+      },
+      {
+        "id": "Importer",
+        "value": "Importer",
+        "active": true
+      },
+      {
+        "id": "Manufacturer",
+        "value": "Manufacturer",
+        "active": true
+      },
+      {
+        "id": "Notified Body",
+        "value": "Notified Body",
+        "active": true
+      },
+      {
+        "id": "System/Procedure Pack Producer",
+        "value": "System/Procedure Pack Producer",
+        "active": true
+      }
+    ]
+  },
+
+  "udi_combination_rules": [
+    {
+      "name": "risk_class_by_legislation",
+      "active": true,
+      "parameters": [
+        "RISK_CLASS_ID",
+        "APPLICABLE_LEGISLATION_ID"
+      ],
+      "pairs": [
+        {
+          "RISK_CLASS_ID": -203.0,
+          "APPLICABLE_LEGISLATION_ID": -197.0,
+          "label": "class_i_mdr"
+        },
+        {
+          "RISK_CLASS_ID": -203.0,
+          "APPLICABLE_LEGISLATION_ID": -53.0,
+          "label": "class_i_mdd"
+        },
+        {
+          "RISK_CLASS_ID": -204.0,
+          "APPLICABLE_LEGISLATION_ID": -197.0,
+          "label": "class_iia_mdr"
+        },
+        {
+          "RISK_CLASS_ID": -204.0,
+          "APPLICABLE_LEGISLATION_ID": -53.0,
+          "label": "class_iia_mdd"
+        },
+        {
+          "RISK_CLASS_ID": -205.0,
+          "APPLICABLE_LEGISLATION_ID": -197.0,
+          "label": "class_iib_mdr"
+        },
+        {
+          "RISK_CLASS_ID": -205.0,
+          "APPLICABLE_LEGISLATION_ID": -53.0,
+          "label": "class_iib_mdd"
+        },
+        {
+          "RISK_CLASS_ID": -10.0,
+          "APPLICABLE_LEGISLATION_ID": -197.0,
+          "label": "class_iii_mdr"
+        },
+        {
+          "RISK_CLASS_ID": -10.0,
+          "APPLICABLE_LEGISLATION_ID": -53.0,
+          "label": "class_iii_mdd"
+        }
+      ]
+    }
+  ],
+
+  "udi_parameters": [
+    {
+      "request_parameter": "APPLICABLE_LEGISLATION_ID",
+      "type": "number",
+      "active": true,
+      "parameter_values": [
+        {
+          "id": -54.0,
+          "value": "AIMDD (Directive 90/385/EEC - Active Implantable Medical Devices)",
+          "active": false
+        },
+        {
+          "id": -55.0,
+          "value": "IVDD (Directive 98/79/EC on in vitro Diagnostic Medical Devices)",
+          "active": false
+        },
+        {
+          "id": -198.0,
+          "value": "IVDR (REGULATION (EU) 2017/746 on in vitro diagnostic medical devices)",
+          "active": false
+        },
+        {
+          "id": -53.0,
+          "value": "MDD (Directive 93/42/EEC on Medical Devices)",
+          "active": false
+        },
+        {
+          "id": -197.0,
+          "value": "MDR (REGULATION (EU) 2017/745 on medical devices)",
+          "active": false
+        },
+        {
+          "id": -3020.0,
+          "value": "NONE",
+          "active": true
+        },
+        {
+          "id": -3021.0,
+          "value": "UNKNOWN",
+          "active": true
+        }
+      ]
+    },
+
+    {
+      "request_parameter": "RISK_CLASS_ID",
+      "type": "number",
+      "active": true,
+      "parameter_values": [
+        {
+          "id": -154.0,
+          "value": "AIMDD",
+          "active": true
+        },
+        {
+          "id": -203.0,
+          "value": "Class I",
+          "active": true
+        },
+        {
+          "id": -204.0,
+          "value": "Class IIa",
+          "active": true
+        },
+        {
+          "id": -205.0,
+          "value": "Class IIb",
+          "active": true
+        },
+        {
+          "id": -10.0,
+          "value": "Class III",
+          "active": true
+        },
+        {
+          "id": -155.0,
+          "value": "IVD Annex II List A",
+          "active": true
+        },
+        {
+          "id": -156.0,
+          "value": "IVD Annex II List B",
+          "active": true
+        },
+        {
+          "id": -219.0,
+          "value": "IVD devices for self-testing",
+          "active": true
+        },
+        {
+          "id": -157.0,
+          "value": "IVD General",
+          "active": true
+        },
+        {
+          "id": -199.0,
+          "value": "Class A",
+          "active": true
+        },
+        {
+          "id": -200.0,
+          "value": "Class B",
+          "active": true
+        },
+        {
+          "id": -201.0,
+          "value": "Class C",
+          "active": true
+        },
+        {
+          "id": -202.0,
+          "value": "Class D",
+          "active": true
+        }
+      ]
+    }
+  ]
+}
