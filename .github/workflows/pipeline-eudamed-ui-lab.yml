@@ -1,0 +1,173 @@
+name: Pipeline EUDAMED UI Lab v4.1
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_size:
+        description: "Devices per page. API currently caps response at 300."
+        required: false
+        default: "300"
+      max_pages:
+        description: "Max list pages. Use 0 for all discovered pages."
+        required: false
+        default: "0"
+      max_device_detail:
+        description: "Device detail calls. 0 = skip, -1 = all fetched devices, positive = sample limit."
+        required: false
+        default: "10000"
+      max_basic_udi:
+        description: "Basic UDI calls. 0 = skip, -1 = all candidates, positive = sample limit. Currently keep 0 until correct ID is known."
+        required: false
+        default: "0"
+      max_actor_detail:
+        description: "Actor detail calls. 0 = skip, -1 = all candidates, positive = sample limit. Currently keep 0 until actor UUID flow is confirmed."
+        required: false
+        default: "0"
+      workers:
+        description: "Parallel workers for list pages. Keep moderate."
+        required: false
+        default: "8"
+      detail_workers:
+        description: "Parallel workers for device details. Keep moderate."
+        required: false
+        default: "6"
+      max_rps:
+        description: "Global request rate cap across workers."
+        required: false
+        default: "5"
+      progress_every:
+        description: "Progress log interval in completed pages/requests."
+        required: false
+        default: "250"
+      compare_latest:
+        description: "Download eudamed-latest DuckDB and compare columns/counts if possible."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      force_dated_release:
+        description: "Delete/recreate dated test release if it already exists."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eudamed-ui-lab-v4-1
+  cancel-in-progress: false
+
+env:
+  DATA_REPO: Wakzi/EUDAHUB-Intelligence-Data
+  OUT_DIR: dist/eudamed_ui_lab
+
+jobs:
+  test-ui-api-v4-1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+
+      - name: Set run metadata
+        run: |
+          echo "RUN_DATE=$(date -u +'%Y%m%d')" >> "$GITHUB_ENV"
+          echo "RUN_TS=$(date -u +'%Y%m%d_%H%M%S')" >> "$GITHUB_ENV"
+          echo "DATED_TAG=eudamed-ui-lab-$(date -u +'%Y%m%d_%H%M%S')" >> "$GITHUB_ENV"
+          echo "LATEST_TAG=eudamed-ui-lab-latest" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests duckdb pyarrow
+
+      - name: Try download current EUDAMED latest DuckDB for comparison
+        if: ${{ github.event.inputs.compare_latest == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          mkdir -p latest_data
+
+          gh release download eudamed-latest \
+            --repo "$DATA_REPO" \
+            --pattern "*.duckdb" \
+            --dir latest_data || true
+
+          echo "LATEST_DUCKDB=" >> "$GITHUB_ENV"
+
+          FOUND_DB="$(find latest_data -maxdepth 1 -name '*.duckdb' | head -n 1 || true)"
+          if [ -n "$FOUND_DB" ]; then
+            echo "LATEST_DUCKDB=$FOUND_DB" >> "$GITHUB_ENV"
+            echo "Found latest DuckDB: $FOUND_DB"
+          else
+            echo "No latest DuckDB found. Comparison will be skipped."
+          fi
+
+      - name: Run EUDAMED UI API v4.1 test
+        run: |
+          python pipelines/eudamed_ui_lab/pipeline_eudamed_ui_lab.py \
+            --out-dir "$OUT_DIR" \
+            --language "en" \
+            --page-size "${{ github.event.inputs.page_size }}" \
+            --max-pages "${{ github.event.inputs.max_pages }}" \
+            --max-device-detail "${{ github.event.inputs.max_device_detail }}" \
+            --max-basic-udi "${{ github.event.inputs.max_basic_udi }}" \
+            --max-actor-detail "${{ github.event.inputs.max_actor_detail }}" \
+            --workers "${{ github.event.inputs.workers }}" \
+            --detail-workers "${{ github.event.inputs.detail_workers }}" \
+            --max-rps "${{ github.event.inputs.max_rps }}" \
+            --progress-every "${{ github.event.inputs.progress_every }}" \
+            --latest-duckdb "${LATEST_DUCKDB:-}"
+
+      - name: List generated files
+        run: |
+          find "$OUT_DIR" -maxdepth 1 -type f -print -exec ls -lh {} \;
+
+      - name: Create dated test release
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          if gh release view "$DATED_TAG" --repo "$DATA_REPO" >/dev/null 2>&1; then
+            if [ "${{ github.event.inputs.force_dated_release }}" = "true" ]; then
+              gh release delete "$DATED_TAG" --repo "$DATA_REPO" --yes || true
+              git push "https://x-access-token:${GH_TOKEN}@github.com/${DATA_REPO}.git" ":refs/tags/$DATED_TAG" || true
+            else
+              echo "Dated test release already exists: $DATED_TAG"
+              exit 0
+            fi
+          fi
+
+          gh release create "$DATED_TAG" \
+            "$OUT_DIR/eudamed_ui_lab.duckdb.zip" \
+            "$OUT_DIR/eudamed_ui_lab_csv.zip" \
+            "$OUT_DIR/ui_api_test_stats.json" \
+            --repo "$DATA_REPO" \
+            --title "EUDAMED UI API Test $RUN_TS" \
+            --notes "POC v4.1 of EUDAMED UI API. Discovery-first full page audit, rate-limited parallel fetch, DuckDB ZIP, CSV ZIP, unzipped stats JSON. No CDC."
+
+      - name: Replace latest test release
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          gh release delete "$LATEST_TAG" --repo "$DATA_REPO" --yes || true
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${DATA_REPO}.git" ":refs/tags/$LATEST_TAG" || true
+
+          gh release create "$LATEST_TAG" \
+            "$OUT_DIR/eudamed_ui_lab.duckdb.zip" \
+            "$OUT_DIR/eudamed_ui_lab_csv.zip" \
+            "$OUT_DIR/ui_api_test_stats.json" \
+            --repo "$DATA_REPO" \
+            --title "Latest EUDAMED UI API Test" \
+            --notes "Latest POC v4.1 of EUDAMED UI API. Discovery-first full page audit, rate-limited parallel fetch, DuckDB ZIP, CSV ZIP, unzipped stats JSON. No CDC."
