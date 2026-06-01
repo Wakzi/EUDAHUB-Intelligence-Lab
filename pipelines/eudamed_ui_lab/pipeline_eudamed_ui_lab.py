@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EUDAHUB EUDAMED UI API POC v4.1
+EUDAHUB EUDAMED UI API POC v4.2
 
 Purpose
 -------
@@ -62,7 +62,7 @@ import pandas as pd
 import requests
 
 BASE_URL = "https://ec.europa.eu/tools/eudamed/api"
-DEFAULT_USER_AGENT = "EUDAHUB-Intelligence-EUDAMED-UI-API-Test/0.4.1"
+DEFAULT_USER_AGENT = "EUDAHUB-Intelligence-EUDAMED-UI-API-Test/0.4.2"
 
 
 # -----------------------------
@@ -487,6 +487,102 @@ def fetch_device_pages_parallel(
     return device_rows, page_audit, request_log, raw_index
 
 
+def retry_failed_or_missing_pages(
+    client: ApiClient,
+    pages: Sequence[int],
+    page_size: int,
+    existing_device_rows: List[Dict[str, Any]],
+    existing_page_audit: List[Dict[str, Any]],
+    existing_request_log: List[Dict[str, Any]],
+    existing_raw_index: List[Dict[str, Any]],
+    retry_rounds: int,
+    workers: int,
+    progress_every: int,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Retry failed/missing pages and replace rows/audit for recovered pages."""
+    all_pages = set(int(p) for p in pages)
+
+    for round_no in range(1, max(0, retry_rounds) + 1):
+        successful = {
+            int(a.get("page"))
+            for a in existing_page_audit
+            if a.get("page") is not None and a.get("ok") is True
+        }
+        explicit_failed = {
+            int(a.get("page"))
+            for a in existing_page_audit
+            if a.get("page") is not None and a.get("ok") is not True
+        }
+        to_retry = sorted((all_pages - successful).union(explicit_failed))
+
+        if not to_retry:
+            log(f"Retry audit complete before round {round_no}: no failed/missing pages remain")
+            break
+
+        log(f"=== Retry round {round_no}/{retry_rounds}: retrying {len(to_retry):,} failed/missing page(s) ===")
+        retry_rows, retry_audit, retry_requests, retry_raw = fetch_device_pages_parallel(
+            client=client,
+            pages=to_retry,
+            page_size=page_size,
+            workers=workers,
+            progress_every=max(1, min(progress_every, 50)),
+        )
+
+        recovered_pages = {
+            int(a.get("page"))
+            for a in retry_audit
+            if a.get("page") is not None and a.get("ok") is True
+        }
+
+        if recovered_pages:
+            existing_device_rows = [
+                r for r in existing_device_rows
+                if int(r.get("_page") or -1) not in recovered_pages
+            ]
+            existing_page_audit = [
+                a for a in existing_page_audit
+                if int(a.get("page") or -1) not in recovered_pages
+            ]
+            existing_raw_index = [
+                r for r in existing_raw_index
+                if int(r.get("page") or -1) not in recovered_pages
+            ]
+
+            existing_device_rows.extend([r for r in retry_rows if int(r.get("_page") or -1) in recovered_pages])
+            existing_page_audit.extend([a for a in retry_audit if int(a.get("page") or -1) in recovered_pages])
+            existing_raw_index.extend([r for r in retry_raw if int(r.get("page") or -1) in recovered_pages])
+            log(f"Retry round {round_no}: recovered {len(recovered_pages):,} page(s)")
+
+        existing_request_log.extend(retry_requests)
+
+        still_failed_pages = {
+            int(a.get("page"))
+            for a in retry_audit
+            if a.get("page") is not None and a.get("ok") is not True
+        }
+        if still_failed_pages:
+            existing_page_audit = [
+                a for a in existing_page_audit
+                if not (int(a.get("page") or -1) in still_failed_pages and a.get("ok") is not True)
+            ]
+            existing_page_audit.extend([a for a in retry_audit if int(a.get("page") or -1) in still_failed_pages])
+
+        successful_after = {
+            int(a.get("page"))
+            for a in existing_page_audit
+            if a.get("page") is not None and a.get("ok") is True
+        }
+        remaining = sorted(all_pages - successful_after)
+        log(f"Retry round {round_no} complete | remaining_failed_or_missing={len(remaining):,}")
+
+    existing_device_rows.sort(key=lambda r: (int(r.get("_page") or 0), int(r.get("_page_index") or 0)))
+    existing_page_audit.sort(key=lambda r: int(r.get("page") or 0))
+    existing_request_log.sort(key=lambda r: (str(r.get("endpoint")), int(r.get("page") or 0) if r.get("page") is not None else -1))
+    existing_raw_index.sort(key=lambda r: int(r.get("page") or 0) if r.get("page") is not None else -1)
+
+    return existing_device_rows, existing_page_audit, existing_request_log, existing_raw_index
+
+
 def select_rows(rows: List[Dict[str, Any]], limit: int, stable_key: str = "uuid") -> List[Dict[str, Any]]:
     if limit == 0:
         return []
@@ -510,8 +606,6 @@ def fetch_device_details(
     detail_rows: List[Dict[str, Any]] = []
     request_log: List[Dict[str, Any]] = []
     raw_index: List[Dict[str, Any]] = []
-    log(f"Device list fetch complete | rows={len(device_rows):,} | page_audit_rows={len(page_audit):,} | request_log_rows={len(request_log):,}")
-
     raw_json_lines: List[str] = []
 
     def one(row: Dict[str, Any]) -> ApiResult:
@@ -752,13 +846,15 @@ def main() -> None:
     parser.add_argument("--max-device-detail", type=int, default=0, help="0=skip, -1=all fetched devices, >0 sample")
     parser.add_argument("--max-basic-udi", type=int, default=0, help="Reserved. 0=skip, -1=all candidates, >0 sample")
     parser.add_argument("--max-actor-detail", type=int, default=0, help="Reserved. 0=skip, -1=all candidates, >0 sample")
-    parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--detail-workers", type=int, default=6)
+    parser.add_argument("--workers", type=int, default=32)
+    parser.add_argument("--detail-workers", type=int, default=16)
     parser.add_argument("--max-rps", type=float, default=5.0, help="Global request rate cap across workers")
     parser.add_argument("--retries", type=int, default=4)
     parser.add_argument("--backoff", type=float, default=1.5)
     parser.add_argument("--timeout", type=int, default=60)
-    parser.add_argument("--progress-every", type=int, default=250)
+    parser.add_argument("--progress-every", type=int, default=50)
+    parser.add_argument("--page-retry-rounds", type=int, default=3, help="Extra retry rounds for failed/missing list pages after first crawl")
+    parser.add_argument("--skip-csv-zip", action="store_true", help="Skip CSV ZIP to save time on full crawls")
     parser.add_argument("--latest-duckdb", default=None)
     parser.add_argument("--keep-unzipped-duckdb", action="store_true")
     args = parser.parse_args()
@@ -774,7 +870,7 @@ def main() -> None:
         timeout=args.timeout,
     )
 
-    log("=== EUDAMED UI API v4.1 test started ===")
+    log("=== EUDAMED UI API v4.2 test started ===")
     log(f"out_dir={out_dir}")
     log(f"page_size={args.page_size} max_pages={args.max_pages} max_rps={args.max_rps} workers={args.workers} detail_workers={args.detail_workers}")
     log(f"details={args.max_device_detail} basic_udi={args.max_basic_udi} actor={args.max_actor_detail} retries={args.retries} backoff={args.backoff}s timeout={args.timeout}s")
@@ -803,8 +899,6 @@ def main() -> None:
         workers=args.workers,
         progress_every=args.progress_every,
     )
-
-    log(f"Device list fetch complete | rows={len(device_rows):,} | page_audit_rows={len(page_audit):,} | request_log_rows={len(request_log):,}")
 
     raw_json_lines: List[str] = []
     device_detail_rows: List[Dict[str, Any]] = []
@@ -881,6 +975,8 @@ def main() -> None:
         "max_rps": args.max_rps,
         "retries": args.retries,
         "backoff": args.backoff,
+        "skip_csv_zip": args.skip_csv_zip,
+        "page_retry_rounds": args.page_retry_rounds,
         "expected": {
             "total_elements": expected_total_elements,
             "total_pages": expected_total_pages,
@@ -894,6 +990,8 @@ def main() -> None:
             "received_rows": received_rows,
             "unique_device_uuid": unique_uuid,
             "duplicate_device_uuid_rows": duplicate_uuid_rows,
+            "expected_rows_for_scope": int(expected_total_elements if args.max_pages == 0 else min(expected_total_elements, requested_pages * response_page_size)),
+            "received_rows_difference": int(received_rows - (expected_total_elements if args.max_pages == 0 else min(expected_total_elements, requested_pages * response_page_size))),
             "received_equals_expected_for_scope": received_rows == (expected_total_elements if args.max_pages == 0 else min(expected_total_elements, requested_pages * response_page_size)),
             "successful_pages_equals_requested_pages": successful_pages == requested_pages,
         },
@@ -950,12 +1048,18 @@ def main() -> None:
         stats["duckdb_zip"] = None
         stats["duckdb_zip_error"] = "Skipped because DuckDB export failed"
 
-    log(f"Compressing CSV ZIP: {csv_zip_path}")
-    csv_started = time.monotonic()
-    write_csv_zip(csv_zip_path, dfs)
-    log(f"CSV ZIP finished in {human_duration(time.monotonic() - csv_started)} | size={human_bytes(path_size(csv_zip_path))}")
-    stats["csv_zip"] = str(csv_zip_path)
-    stats["output_files"].append(csv_zip_path.name)
+    if args.skip_csv_zip:
+        log("Skipping CSV ZIP because --skip-csv-zip is enabled")
+        stats["csv_zip"] = None
+        stats["csv_zip_skipped"] = True
+    else:
+        log(f"Compressing CSV ZIP: {csv_zip_path}")
+        csv_started = time.monotonic()
+        write_csv_zip(csv_zip_path, dfs)
+        log(f"CSV ZIP finished in {human_duration(time.monotonic() - csv_started)} | size={human_bytes(path_size(csv_zip_path))}")
+        stats["csv_zip"] = str(csv_zip_path)
+        stats["csv_zip_skipped"] = False
+        stats["output_files"].append(csv_zip_path.name)
 
     # Stats are deliberately unzipped.
     stats["output_files"].append(stats_path.name)
