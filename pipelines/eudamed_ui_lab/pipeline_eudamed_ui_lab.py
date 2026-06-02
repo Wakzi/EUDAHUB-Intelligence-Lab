@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EUDAHUB EUDAMED UI API POC v4.2
+EUDAHUB EUDAMED UI API POC v4.3
 
 Purpose
 -------
@@ -62,7 +62,7 @@ import pandas as pd
 import requests
 
 BASE_URL = "https://ec.europa.eu/tools/eudamed/api"
-DEFAULT_USER_AGENT = "EUDAHUB-Intelligence-EUDAMED-UI-API-Test/0.4.2"
+DEFAULT_USER_AGENT = "EUDAHUB-Intelligence-EUDAMED-UI-API-Test/0.4.3"
 
 
 # -----------------------------
@@ -202,6 +202,82 @@ class TokenBucketRateLimiter:
             time.sleep(sleep_for + random.random() * self.jitter)
 
 
+
+class GlobalThrottle:
+    """Shared circuit breaker for HTTP 429 waves."""
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        base_pause: float = 60.0,
+        max_pause: float = 300.0,
+        threshold: int = 3,
+        window_seconds: float = 30.0,
+    ):
+        self.enabled = enabled
+        self.base_pause = max(1.0, float(base_pause))
+        self.max_pause = max(self.base_pause, float(max_pause))
+        self.threshold = max(1, int(threshold))
+        self.window_seconds = max(1.0, float(window_seconds))
+        self.lock = threading.Lock()
+        self.pause_until = 0.0
+        self.recent_429s: List[float] = []
+        self.penalty_level = 0
+
+    def wait_if_paused(self) -> None:
+        if not self.enabled:
+            return
+        while True:
+            with self.lock:
+                remaining = self.pause_until - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 5.0))
+
+    def register_429(self, retry_after: Optional[str], endpoint: str, page: Optional[int]) -> Optional[float]:
+        if not self.enabled:
+            return None
+
+        now = time.monotonic()
+        retry_after_seconds: Optional[float] = None
+        if retry_after:
+            try:
+                retry_after_seconds = float(str(retry_after).strip())
+            except Exception:
+                retry_after_seconds = None
+
+        with self.lock:
+            self.recent_429s = [t for t in self.recent_429s if now - t <= self.window_seconds]
+            self.recent_429s.append(now)
+
+            should_pause = retry_after_seconds is not None or len(self.recent_429s) >= self.threshold
+            if not should_pause:
+                return None
+
+            if retry_after_seconds is not None:
+                pause_for = min(self.max_pause, max(self.base_pause, retry_after_seconds))
+            else:
+                self.penalty_level += 1
+                pause_for = min(self.max_pause, self.base_pause * self.penalty_level)
+
+            new_pause_until = now + pause_for
+            if new_pause_until > self.pause_until:
+                self.pause_until = new_pause_until
+                log(
+                    f"GLOBAL THROTTLE: HTTP 429 wave detected endpoint={endpoint} page={page} "
+                    f"recent_429s={len(self.recent_429s)} retry_after={retry_after!r} "
+                    f"sleep={pause_for:.0f}s penalty_level={self.penalty_level}"
+                )
+            return pause_for
+
+    def register_success(self) -> None:
+        if not self.enabled:
+            return
+        with self.lock:
+            if self.penalty_level > 0 and time.monotonic() > self.pause_until:
+                self.penalty_level = max(0, self.penalty_level - 1)
+
+
 @dataclass
 class ApiResult:
     endpoint: str
@@ -224,12 +300,24 @@ class ApiClient:
         backoff: float,
         timeout: int,
         user_agent: str = DEFAULT_USER_AGENT,
+        global_throttle_enabled: bool = True,
+        global_429_pause: float = 60.0,
+        global_429_max_pause: float = 300.0,
+        global_429_threshold: int = 3,
+        global_429_window: float = 30.0,
     ):
         self.language = language
         self.retries = max(0, int(retries))
         self.backoff = max(0.1, float(backoff))
         self.timeout = int(timeout)
         self.limiter = TokenBucketRateLimiter(max_rps=max_rps)
+        self.global_throttle = GlobalThrottle(
+            enabled=global_throttle_enabled,
+            base_pause=global_429_pause,
+            max_pause=global_429_max_pause,
+            threshold=global_429_threshold,
+            window_seconds=global_429_window,
+        )
         self.local = threading.local()
         self.user_agent = user_agent
 
@@ -246,6 +334,7 @@ class ApiClient:
     def get_json(self, endpoint: str, url: str, params: Optional[dict] = None, page: Optional[int] = None) -> ApiResult:
         last_result: Optional[ApiResult] = None
         for attempt in range(1, self.retries + 2):
+            self.global_throttle.wait_if_paused()
             self.limiter.wait()
             started = time.monotonic()
             status_code = None
@@ -255,6 +344,7 @@ class ApiClient:
                 duration_ms = int((time.monotonic() - started) * 1000)
                 status_code = r.status_code
                 final_url = r.url
+                retry_after = r.headers.get("Retry-After")
                 try:
                     data = r.json()
                     parse_error = None
@@ -280,12 +370,18 @@ class ApiClient:
                 last_result = result
 
                 if result.ok:
+                    self.global_throttle.register_success()
                     return result
 
                 # Retry transient server/rate-limit errors, not 404.
                 if status_code in (408, 409, 425, 429, 500, 502, 503, 504):
+                    if status_code == 429:
+                        self.global_throttle.register_429(retry_after, endpoint=endpoint, page=page)
                     sleep_for = self.backoff * attempt + random.random() * 0.2
-                    log(f"WARNING transient HTTP {status_code} endpoint={endpoint} page={page} attempt={attempt}/{self.retries + 1}; backoff={sleep_for:.1f}s")
+                    log(
+                        f"WARNING transient HTTP {status_code} endpoint={endpoint} page={page} "
+                        f"attempt={attempt}/{self.retries + 1}; retry_after={retry_after!r}; backoff={sleep_for:.1f}s"
+                    )
                     time.sleep(sleep_for)
                     continue
                 return result
@@ -498,6 +594,8 @@ def retry_failed_or_missing_pages(
     retry_rounds: int,
     workers: int,
     progress_every: int,
+    retry_pause_seconds: float = 60.0,
+    recovery_workers: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Retry failed/missing pages and replace rows/audit for recovered pages."""
     all_pages = set(int(p) for p in pages)
@@ -519,12 +617,19 @@ def retry_failed_or_missing_pages(
             log(f"Retry audit complete before round {round_no}: no failed/missing pages remain")
             break
 
-        log(f"=== Retry round {round_no}/{retry_rounds}: retrying {len(to_retry):,} failed/missing page(s) ===")
+        recovery_workers = max(1, int(recovery_workers or min(workers, 4)))
+        pause_for = retry_pause_seconds * round_no
+        log(
+            f"=== Page recovery round {round_no}/{retry_rounds}: "
+            f"{len(to_retry):,} failed/missing page(s); sleeping {pause_for:.0f}s before retry; "
+            f"recovery_workers={recovery_workers} ==="
+        )
+        time.sleep(max(0.0, pause_for))
         retry_rows, retry_audit, retry_requests, retry_raw = fetch_device_pages_parallel(
             client=client,
             pages=to_retry,
             page_size=page_size,
-            workers=workers,
+            workers=recovery_workers,
             progress_every=max(1, min(progress_every, 50)),
         )
 
@@ -809,7 +914,9 @@ def write_duckdb(db_path: Path, dfs: Dict[str, pd.DataFrame]) -> Optional[str]:
     try:
         con = duckdb.connect(str(db_path))
         for name, df in dfs.items():
-            # DuckDB can create table from pandas relation.
+            if df.empty and len(df.columns) == 0:
+                con.execute(f'CREATE TABLE "{name}" (_empty BOOLEAN)')
+                continue
             con.register("_df", df)
             con.execute(f'CREATE TABLE "{name}" AS SELECT * FROM _df')
             con.unregister("_df")
@@ -846,14 +953,21 @@ def main() -> None:
     parser.add_argument("--max-device-detail", type=int, default=0, help="0=skip, -1=all fetched devices, >0 sample")
     parser.add_argument("--max-basic-udi", type=int, default=0, help="Reserved. 0=skip, -1=all candidates, >0 sample")
     parser.add_argument("--max-actor-detail", type=int, default=0, help="Reserved. 0=skip, -1=all candidates, >0 sample")
-    parser.add_argument("--workers", type=int, default=32)
-    parser.add_argument("--detail-workers", type=int, default=16)
+    parser.add_argument("--workers", type=int, default=12)
+    parser.add_argument("--detail-workers", type=int, default=8)
     parser.add_argument("--max-rps", type=float, default=5.0, help="Global request rate cap across workers")
     parser.add_argument("--retries", type=int, default=4)
     parser.add_argument("--backoff", type=float, default=1.5)
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--progress-every", type=int, default=50)
-    parser.add_argument("--page-retry-rounds", type=int, default=3, help="Extra retry rounds for failed/missing list pages after first crawl")
+    parser.add_argument("--page-retry-rounds", type=int, default=5, help="Extra retry rounds for failed/missing list pages after first crawl")
+    parser.add_argument("--page-retry-pause", type=float, default=60.0, help="Seconds to wait before page recovery; multiplied by recovery round")
+    parser.add_argument("--recovery-workers", type=int, default=4, help="Workers used only for failed-page recovery passes")
+    parser.add_argument("--global-429-pause", type=float, default=60.0, help="Global pause seconds when a 429 wave is detected")
+    parser.add_argument("--global-429-max-pause", type=float, default=300.0, help="Maximum global pause seconds")
+    parser.add_argument("--global-429-threshold", type=int, default=3, help="Number of 429s in window before global pause")
+    parser.add_argument("--global-429-window", type=float, default=30.0, help="Window seconds for global 429 threshold")
+    parser.add_argument("--disable-global-429-throttle", action="store_true", help="Disable global 429 circuit breaker")
     parser.add_argument("--skip-csv-zip", action="store_true", help="Skip CSV ZIP to save time on full crawls")
     parser.add_argument("--latest-duckdb", default=None)
     parser.add_argument("--keep-unzipped-duckdb", action="store_true")
@@ -868,9 +982,14 @@ def main() -> None:
         retries=args.retries,
         backoff=args.backoff,
         timeout=args.timeout,
+        global_throttle_enabled=not args.disable_global_429_throttle,
+        global_429_pause=args.global_429_pause,
+        global_429_max_pause=args.global_429_max_pause,
+        global_429_threshold=args.global_429_threshold,
+        global_429_window=args.global_429_window,
     )
 
-    log("=== EUDAMED UI API v4.2 test started ===")
+    log("=== EUDAMED UI API v4.3 test started ===")
     log(f"out_dir={out_dir}")
     log(f"page_size={args.page_size} max_pages={args.max_pages} max_rps={args.max_rps} workers={args.workers} detail_workers={args.detail_workers}")
     log(f"details={args.max_device_detail} basic_udi={args.max_basic_udi} actor={args.max_actor_detail} retries={args.retries} backoff={args.backoff}s timeout={args.timeout}s")
@@ -977,6 +1096,13 @@ def main() -> None:
         "backoff": args.backoff,
         "skip_csv_zip": args.skip_csv_zip,
         "page_retry_rounds": args.page_retry_rounds,
+        "page_retry_pause": args.page_retry_pause,
+        "recovery_workers": args.recovery_workers,
+        "global_429_throttle_enabled": not args.disable_global_429_throttle,
+        "global_429_pause": args.global_429_pause,
+        "global_429_max_pause": args.global_429_max_pause,
+        "global_429_threshold": args.global_429_threshold,
+        "global_429_window": args.global_429_window,
         "expected": {
             "total_elements": expected_total_elements,
             "total_pages": expected_total_pages,
