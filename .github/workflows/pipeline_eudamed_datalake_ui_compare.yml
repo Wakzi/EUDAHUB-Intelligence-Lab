@@ -1,0 +1,198 @@
+name: Pipeline EUDAMED Datalake vs UI Compare
+
+on:
+  workflow_dispatch:
+    inputs:
+      datalake_tag:
+        description: "Tag in EUDAHUB-Intelligence-Data containing eudamed_raw_latest.duckdb"
+        required: true
+        default: "eudamed-raw-latest"
+        type: string
+      ui_tag:
+        description: "Tag in EUDAHUB-Intelligence containing eudamed_ui_lab.duckdb"
+        required: true
+        default: "eudamed-ui-lab-latest"
+        type: string
+      datalake_table:
+        description: "Datalake table to compare"
+        required: true
+        default: "udi"
+        type: string
+      ui_table:
+        description: "UI table to compare, or auto"
+        required: true
+        default: "auto"
+        type: string
+      key:
+        description: "Comparison key, usually UUID, or auto"
+        required: true
+        default: "auto"
+        type: string
+      sample_limit:
+        description: "Max key samples per side"
+        required: true
+        default: "5000"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eudamed-datalake-ui-compare
+  cancel-in-progress: false
+
+env:
+  DATA_REPO: Wakzi/EUDAHUB-Intelligence-Data
+  MAIN_REPO: Wakzi/EUDAHUB-Intelligence
+  OUT_DIR: dist/eudamed_datalake_ui_compare
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install duckdb pandas requests
+
+      - name: Prepare workspace
+        run: |
+          rm -rf "$OUT_DIR" inputs
+          mkdir -p "$OUT_DIR" inputs
+
+      - name: Download Datalake raw DuckDB from Data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN || github.token }}
+        run: |
+          gh release download "${{ inputs.datalake_tag }}" \
+            --repo "$DATA_REPO" \
+            --pattern "eudamed_raw_latest.duckdb" \
+            --dir inputs \
+            --clobber
+          test -s inputs/eudamed_raw_latest.duckdb
+
+      - name: Download UI Lab DuckDB from Main repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.ui_tag }}" \
+            --repo "$MAIN_REPO" \
+            --pattern "eudamed_ui_lab.duckdb" \
+            --dir inputs \
+            --clobber
+          test -s inputs/eudamed_ui_lab.duckdb
+
+      - name: Run comparison
+        run: |
+          python -u pipelines/eudamed/pipeline_eudamed_datalake_ui_compare.py \
+            --datalake-db inputs/eudamed_raw_latest.duckdb \
+            --ui-db inputs/eudamed_ui_lab.duckdb \
+            --datalake-table "${{ inputs.datalake_table }}" \
+            --ui-table "${{ inputs.ui_table }}" \
+            --key "${{ inputs.key }}" \
+            --sample-limit "${{ inputs.sample_limit }}" \
+            --out-dir "$OUT_DIR"
+
+      - name: Create asset names
+        id: names
+        run: |
+          TS="$(date -u +'%Y%m%d_%H%M%S')"
+          echo "ts=$TS" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=eudamed-datalake-ui-compare-latest" >> "$GITHUB_OUTPUT"
+          echo "dated_tag=eudamed-datalake-ui-compare-$TS" >> "$GITHUB_OUTPUT"
+          echo "latest_title=EUDAMED Datalake vs UI Compare Latest" >> "$GITHUB_OUTPUT"
+          echo "dated_title=EUDAMED Datalake vs UI Compare $TS" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare dated asset copies
+        run: |
+          TS="${{ steps.names.outputs.ts }}"
+          mkdir -p "$OUT_DIR/dated_assets" "$OUT_DIR/latest_assets"
+
+          cp "$OUT_DIR"/*.csv "$OUT_DIR/latest_assets/"
+          cp "$OUT_DIR/eudamed_datalake_ui_compare_summary.json" "$OUT_DIR/latest_assets/"
+
+          for f in "$OUT_DIR"/*.csv "$OUT_DIR/eudamed_datalake_ui_compare_summary.json"; do
+            base="$(basename "$f")"
+            name="${base%.*}"
+            ext="${base##*.}"
+            cp "$f" "$OUT_DIR/dated_assets/${name}_${TS}.${ext}"
+          done
+
+      - name: Upsert latest comparison release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.names.outputs.latest_tag }}"
+          TITLE="${{ steps.names.outputs.latest_title }}"
+          NOTES="$OUT_DIR/RELEASE_NOTES_EUDAMED_DATALAKE_UI_COMPARE.md"
+
+          if gh release view "$TAG" --repo "$MAIN_REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$MAIN_REPO" \
+              --title "$TITLE" \
+              --notes-file "$NOTES" \
+              --latest=false
+
+            for asset in "$OUT_DIR/latest_assets"/*; do
+              name="$(basename "$asset")"
+              gh release delete-asset "$TAG" "$name" --repo "$MAIN_REPO" -y >/dev/null 2>&1 || true
+            done
+
+            gh release upload "$TAG" "$OUT_DIR/latest_assets"/* \
+              --repo "$MAIN_REPO" \
+              --clobber
+          else
+            gh release create "$TAG" "$OUT_DIR/latest_assets"/* \
+              --repo "$MAIN_REPO" \
+              --title "$TITLE" \
+              --notes-file "$NOTES" \
+              --latest=false
+          fi
+
+      - name: Create dated comparison release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.names.outputs.dated_tag }}"
+          TITLE="${{ steps.names.outputs.dated_title }}"
+          NOTES="$OUT_DIR/RELEASE_NOTES_EUDAMED_DATALAKE_UI_COMPARE.md"
+
+          if gh release view "$TAG" --repo "$MAIN_REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$MAIN_REPO" \
+              --title "$TITLE" \
+              --notes-file "$NOTES" \
+              --latest=false
+
+            for asset in "$OUT_DIR/dated_assets"/*; do
+              name="$(basename "$asset")"
+              gh release delete-asset "$TAG" "$name" --repo "$MAIN_REPO" -y >/dev/null 2>&1 || true
+            done
+
+            gh release upload "$TAG" "$OUT_DIR/dated_assets"/* \
+              --repo "$MAIN_REPO" \
+              --clobber
+          else
+            gh release create "$TAG" "$OUT_DIR/dated_assets"/* \
+              --repo "$MAIN_REPO" \
+              --title "$TITLE" \
+              --notes-file "$NOTES" \
+              --latest=false
+          fi
+
+      - name: Upload debug artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eudamed-datalake-ui-compare-outputs
+          path: dist/eudamed_datalake_ui_compare
+          retention-days: 7
