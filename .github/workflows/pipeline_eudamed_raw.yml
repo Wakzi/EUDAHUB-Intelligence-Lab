@@ -1,0 +1,280 @@
+name: Pipeline EUDAMED Raw
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Fetch mode"
+        required: true
+        default: "partitioned"
+        type: choice
+        options:
+          - partitioned
+          - partitioned_trace
+          - full
+          - full_trace
+
+  # Enable later when raw has been tested manually.
+  # schedule:
+  #   - cron: "0 2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eudamed-raw-pipeline
+  cancel-in-progress: false
+
+env:
+  DATA_REPO: Wakzi/EUDAHUB-Intelligence-Data
+  MAIN_REPO: Wakzi/EUDAHUB-Intelligence
+
+jobs:
+  fetch-eudamed-raw:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Lab repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate UTC timestamp
+        id: timestamp
+        run: |
+          echo "date=$(date -u +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+          echo "date_compact=$(date -u +'%Y%m%d')" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$(date -u +'%Y%m%d_%H%M%S')" >> "$GITHUB_OUTPUT"
+          echo "timestamp_human=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+
+      - name: Choose run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=partitioned" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download previous raw metadata from Data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          mkdir -p previous_raw
+
+          gh release download eudamed-raw-latest \
+            --repo "$DATA_REPO" \
+            --pattern "eudamed_raw_latest.metadata.json" \
+            --dir previous_raw \
+            --clobber || true
+
+          if [ -f previous_raw/eudamed_raw_latest.metadata.json ]; then
+            cp previous_raw/eudamed_raw_latest.metadata.json previous_raw_metadata.json
+            echo "OK restored previous raw metadata"
+            cat previous_raw_metadata.json | head -40
+          else
+            echo "INFO no previous raw metadata found. Schema changes will be baseline."
+          fi
+
+      - name: Run EUDAMED raw pipeline
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python -u pipelines/eudamed/pipeline_eudamed_raw.py \
+            --mode "${{ steps.mode.outputs.mode }}" \
+            --timestamp "${{ steps.timestamp.outputs.timestamp }}" \
+            --previous-metadata previous_raw_metadata.json
+
+      - name: List generated files
+        run: |
+          ls -lh
+
+      - name: Validate raw assets exist
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          test -f "eudamed_raw_latest.duckdb"
+          test -f "eudamed_raw_latest.metadata.json"
+          test -f "eudamed_raw_${TS}.duckdb"
+          test -f "eudamed_raw_${TS}.metadata.json"
+          test -f "RELEASE_NOTES_EUDAMED_RAW.md"
+
+      - name: Create or update dated raw release in Data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          TAG="eudamed-raw-${TS}"
+          TITLE="EUDAMED Raw Snapshot - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$DATA_REPO"
+
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_RAW.md \
+              --latest=false
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_RAW.md \
+              --latest=false
+          fi
+
+          for asset in \
+            "eudamed_raw_${TS}.duckdb" \
+            "eudamed_raw_${TS}.metadata.json" \
+            "RELEASE_NOTES_EUDAMED_RAW.md"
+          do
+            gh release delete-asset "$TAG" "$asset" --repo "$REPO" --yes || true
+          done
+
+          gh release upload "$TAG" \
+            "eudamed_raw_${TS}.duckdb" \
+            "eudamed_raw_${TS}.metadata.json" \
+            RELEASE_NOTES_EUDAMED_RAW.md \
+            --repo "$REPO" \
+            --clobber
+
+      - name: Create or update latest raw release in Data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TAG="eudamed-raw-latest"
+          TITLE="Latest EUDAMED Raw Snapshot"
+          REPO="$DATA_REPO"
+
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_RAW.md \
+              --latest=false
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_RAW.md \
+              --latest=false
+          fi
+
+          for asset in \
+            eudamed_raw_latest.duckdb \
+            eudamed_raw_latest.metadata.json \
+            RELEASE_NOTES_EUDAMED_RAW.md
+          do
+            gh release delete-asset "$TAG" "$asset" --repo "$REPO" --yes || true
+          done
+
+          gh release upload "$TAG" \
+            eudamed_raw_latest.duckdb \
+            eudamed_raw_latest.metadata.json \
+            RELEASE_NOTES_EUDAMED_RAW.md \
+            --repo "$REPO" \
+            --clobber
+
+      - name: Create or update dated trace release in Main repo
+        if: contains(steps.mode.outputs.mode, '_trace')
+        env:
+          GH_TOKEN: ${{ secrets.INTELLIGENCE_REPO_TOKEN }}
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          TAG="eudamed-trace-${TS}"
+          TITLE="EUDAMED Trace Research - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$MAIN_REPO"
+
+          test -f "eudamed_trace_${TS}.duckdb"
+          test -f "eudamed_trace_${TS}.metadata.json"
+          test -f "RELEASE_NOTES_EUDAMED_TRACE.md"
+
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_TRACE.md \
+              --latest=false
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_TRACE.md \
+              --latest=false
+          fi
+
+          for asset in \
+            "eudamed_trace_${TS}.duckdb" \
+            "eudamed_trace_${TS}.metadata.json" \
+            "RELEASE_NOTES_EUDAMED_TRACE.md"
+          do
+            gh release delete-asset "$TAG" "$asset" --repo "$REPO" --yes || true
+          done
+
+          gh release upload "$TAG" \
+            "eudamed_trace_${TS}.duckdb" \
+            "eudamed_trace_${TS}.metadata.json" \
+            RELEASE_NOTES_EUDAMED_TRACE.md \
+            --repo "$REPO" \
+            --clobber
+
+      - name: Create or update latest trace release in Main repo
+        if: contains(steps.mode.outputs.mode, '_trace')
+        env:
+          GH_TOKEN: ${{ secrets.INTELLIGENCE_REPO_TOKEN }}
+        run: |
+          TAG="eudamed-trace-latest"
+          TITLE="Latest EUDAMED Trace Research"
+          REPO="$MAIN_REPO"
+
+          test -f "eudamed_trace_latest.duckdb"
+          test -f "eudamed_trace_latest.metadata.json"
+          test -f "RELEASE_NOTES_EUDAMED_TRACE.md"
+
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_TRACE.md \
+              --latest=false
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_TRACE.md \
+              --latest=false
+          fi
+
+          for asset in \
+            eudamed_trace_latest.duckdb \
+            eudamed_trace_latest.metadata.json \
+            RELEASE_NOTES_EUDAMED_TRACE.md
+          do
+            gh release delete-asset "$TAG" "$asset" --repo "$REPO" --yes || true
+          done
+
+          gh release upload "$TAG" \
+            eudamed_trace_latest.duckdb \
+            eudamed_trace_latest.metadata.json \
+            RELEASE_NOTES_EUDAMED_TRACE.md \
+            --repo "$REPO" \
+            --clobber
+
+      - name: Upload workflow debug artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eudamed-raw-${{ steps.mode.outputs.mode }}-${{ steps.timestamp.outputs.timestamp }}
+          path: |
+            *.metadata.json
+            RELEASE_NOTES_EUDAMED_RAW.md
+            RELEASE_NOTES_EUDAMED_TRACE.md
+          retention-days: 30
