@@ -57,7 +57,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_FILE = SCRIPT_DIR / "config" / "eudamed_filters.json"
 
 PIPELINE_NAME = "eudamed_raw"
-PIPELINE_VERSION = "2.0.0-raw"
+PIPELINE_VERSION = "2.0.1-raw"
 
 RAW_LATEST_DB = "eudamed_raw_latest.duckdb"
 TRACE_LATEST_DB = "eudamed_trace_latest.duckdb"
@@ -385,13 +385,13 @@ def write_trace_db(trace_db_path: str) -> dict[str, Any]:
 # =============================================================================
 
 def raw_cell_to_storage_value(value: Any) -> str | None:
-    """Store API values reliably without filtering/renaming source fields.
+    """Convert one API value for safe VARCHAR storage.
 
-    DuckDB tables need stable column types across batches. To avoid type conflicts
-    when the API changes or returns mixed values, values are stored as VARCHAR.
-    - None stays NULL.
-    - dict/list are compact JSON text.
-    - scalar values are converted to text.
+    This is only used by the nested-data fallback path. The EUDAMED Datalake
+    API currently returns flat scalar fields for reference/actors/udi, so the
+    normal fast path uses pandas directly. If the API later returns a real
+    dict/list value, this fallback stores that nested value as compact JSON text
+    instead of failing the raw snapshot.
     """
     if value is None:
         return None
@@ -400,9 +400,44 @@ def raw_cell_to_storage_value(value: Any) -> str | None:
     return str(value)
 
 
+def batch_has_nested_values(rows: list[dict[str, Any]]) -> bool:
+    """Return True if a batch contains real nested JSON values.
+
+    Important: JSON-looking strings from EUDAMED, such as text fields containing
+    '{"texts": ...}', are strings and therefore stay on the fast path. Only
+    actual Python dict/list objects trigger safe normalization.
+    """
+    for row in rows:
+        for value in row.values():
+            if isinstance(value, (dict, list)):
+                return True
+    return False
+
+
 def normalize_rows_for_duckdb(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    """Convert one streamed API batch into a DuckDB-ready DataFrame.
+
+    Fast path:
+    - Used for normal EUDAMED Datalake batches.
+    - Builds a DataFrame directly and casts columns to string using pandas.
+    - Avoids a Python-level cell-by-cell conversion across millions of cells.
+
+    Safe fallback:
+    - Used only if a batch contains real nested dict/list values.
+    - Serializes those nested values to compact JSON text.
+    - Keeps the pipeline stable if the API schema evolves unexpectedly.
+    """
     if not rows:
         return pd.DataFrame()
+
+    if not batch_has_nested_values(rows):
+        return pd.DataFrame(rows).astype(str)
+
+    print(
+        "WARNING nested dict/list values detected in batch. "
+        "Using safe JSON normalization for this batch.",
+        flush=True,
+    )
 
     normalized_rows: list[dict[str, Any]] = []
     for row in rows:
