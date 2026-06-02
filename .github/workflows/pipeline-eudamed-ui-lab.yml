@@ -1,4 +1,4 @@
-name: Pipeline EUDAMED UI Lab v4.2
+name: Pipeline EUDAMED UI Lab v4.3
 
 on:
   workflow_dispatch:
@@ -26,35 +26,51 @@ on:
       workers:
         description: "Parallel workers for list pages."
         required: false
-        default: "32"
+        default: "12"
       detail_workers:
         description: "Parallel workers for device details."
         required: false
-        default: "16"
+        default: "8"
       max_rps:
         description: "Global max request starts per second."
         required: false
-        default: "5"
+        default: "3"
       progress_every:
         description: "Log progress every N pages/details."
         required: false
         default: "50"
       page_retry_rounds:
-        description: "Extra retry rounds for failed/missing list pages."
+        description: "Extra recovery rounds for failed/missing list pages."
+        required: false
+        default: "5"
+      page_retry_pause:
+        description: "Seconds to wait before page recovery; multiplied by recovery round."
+        required: false
+        default: "60"
+      recovery_workers:
+        description: "Workers used only for failed-page recovery passes."
+        required: false
+        default: "4"
+      global_429_pause:
+        description: "Global pause seconds when a 429 wave is detected."
+        required: false
+        default: "60"
+      global_429_max_pause:
+        description: "Maximum global pause seconds."
+        required: false
+        default: "300"
+      global_429_threshold:
+        description: "Number of 429s in window before global pause."
         required: false
         default: "3"
+      global_429_window:
+        description: "Window seconds for global 429 threshold."
+        required: false
+        default: "30"
       skip_csv_zip:
         description: "Skip CSV ZIP to save time on full crawls."
         required: false
         default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
-      compare_latest:
-        description: "Download eudamed-latest DuckDB and compare if possible."
-        required: false
-        default: "false"
         type: choice
         options:
           - "true"
@@ -68,7 +84,7 @@ env:
   OUT_DIR: dist/eudamed_ui_lab
 
 jobs:
-  test-ui-api-v4-2:
+  test-ui-api-v4-3:
     runs-on: ubuntu-latest
 
     steps:
@@ -106,6 +122,12 @@ jobs:
             --max-rps "${{ github.event.inputs.max_rps }}" \
             --progress-every "${{ github.event.inputs.progress_every }}" \
             --page-retry-rounds "${{ github.event.inputs.page_retry_rounds }}" \
+            --page-retry-pause "${{ github.event.inputs.page_retry_pause }}" \
+            --recovery-workers "${{ github.event.inputs.recovery_workers }}" \
+            --global-429-pause "${{ github.event.inputs.global_429_pause }}" \
+            --global-429-max-pause "${{ github.event.inputs.global_429_max_pause }}" \
+            --global-429-threshold "${{ github.event.inputs.global_429_threshold }}" \
+            --global-429-window "${{ github.event.inputs.global_429_window }}" \
             $([ "${{ github.event.inputs.skip_csv_zip }}" = "true" ] && echo "--skip-csv-zip")
 
       - name: List generated files
@@ -119,7 +141,7 @@ jobs:
           gh release create "$DATED_TAG" "$OUT_DIR"/* \
             --repo "$DATA_REPO" \
             --title "EUDAMED UI Lab $RUN_TS" \
-            --notes "EUDAMED UI Lab v4.2 crawl."
+            --notes "EUDAMED UI Lab v4.3 crawl."
 
       - name: Replace latest release
         env:
@@ -131,4 +153,4 @@ jobs:
           gh release create "$LATEST_TAG" "$OUT_DIR"/* \
             --repo "$DATA_REPO" \
             --title "Latest EUDAMED UI Lab" \
-            --notes "Latest EUDAMED UI Lab v4.2 crawl."
+            --notes "Latest EUDAMED UI Lab v4.3 crawl."
