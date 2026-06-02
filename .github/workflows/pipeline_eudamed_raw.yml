@@ -27,7 +27,6 @@ concurrency:
 
 env:
   DATA_REPO: Wakzi/EUDAHUB-Intelligence-Data
-  MAIN_REPO: Wakzi/EUDAHUB-Intelligence
 
 jobs:
   fetch-eudamed-raw:
@@ -146,35 +145,25 @@ jobs:
             --repo "$REPO" \
             --clobber
 
-      - name: Create or update latest raw release in Data repo
+      - name: Recreate latest raw release in Data repo
         env:
           GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           TAG="eudamed-raw-latest"
-          TITLE="Latest EUDAMED Raw Snapshot"
+          TITLE="Latest EUDAMED Raw Snapshot - ${{ steps.timestamp.outputs.timestamp_human }}"
           REPO="$DATA_REPO"
 
-          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
-            gh release edit "$TAG" \
-              --repo "$REPO" \
-              --title "$TITLE" \
-              --notes-file RELEASE_NOTES_EUDAMED_RAW.md \
-              --latest=false
-          else
-            gh release create "$TAG" \
-              --repo "$REPO" \
-              --title "$TITLE" \
-              --notes-file RELEASE_NOTES_EUDAMED_RAW.md \
-              --latest=false
-          fi
+          # GitHub release lists use the release creation/publish time.
+          # Editing an existing latest release does not move it to the top.
+          # Therefore latest releases are deleted and recreated every run.
+          # --latest=false prevents GitHub from marking this as the green repository Latest release.
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag || true
 
-          for asset in \
-            eudamed_raw_latest.duckdb \
-            eudamed_raw_latest.metadata.json \
-            RELEASE_NOTES_EUDAMED_RAW.md
-          do
-            gh release delete-asset "$TAG" "$asset" --repo "$REPO" --yes || true
-          done
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "$TITLE" \
+            --notes-file RELEASE_NOTES_EUDAMED_RAW.md \
+            --latest=false
 
           gh release upload "$TAG" \
             eudamed_raw_latest.duckdb \
@@ -183,15 +172,15 @@ jobs:
             --repo "$REPO" \
             --clobber
 
-      - name: Create or update dated trace release in Main repo
+      - name: Create or update dated trace release in Data repo
         if: contains(steps.mode.outputs.mode, '_trace')
         env:
-          GH_TOKEN: ${{ secrets.INTELLIGENCE_REPO_TOKEN }}
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           TS="${{ steps.timestamp.outputs.timestamp }}"
           TAG="eudamed-trace-${TS}"
           TITLE="EUDAMED Trace Research - ${{ steps.timestamp.outputs.timestamp_human }}"
-          REPO="$MAIN_REPO"
+          REPO="$DATA_REPO"
 
           test -f "eudamed_trace_${TS}.duckdb"
           test -f "eudamed_trace_${TS}.metadata.json"
@@ -226,40 +215,29 @@ jobs:
             --repo "$REPO" \
             --clobber
 
-      - name: Create or update latest trace release in Main repo
+      - name: Recreate latest trace release in Data repo
         if: contains(steps.mode.outputs.mode, '_trace')
         env:
-          GH_TOKEN: ${{ secrets.INTELLIGENCE_REPO_TOKEN }}
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           TAG="eudamed-trace-latest"
-          TITLE="Latest EUDAMED Trace Research"
-          REPO="$MAIN_REPO"
+          TITLE="Latest EUDAMED Trace Research - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$DATA_REPO"
 
           test -f "eudamed_trace_latest.duckdb"
           test -f "eudamed_trace_latest.metadata.json"
           test -f "RELEASE_NOTES_EUDAMED_TRACE.md"
 
-          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
-            gh release edit "$TAG" \
-              --repo "$REPO" \
-              --title "$TITLE" \
-              --notes-file RELEASE_NOTES_EUDAMED_TRACE.md \
-              --latest=false
-          else
-            gh release create "$TAG" \
-              --repo "$REPO" \
-              --title "$TITLE" \
-              --notes-file RELEASE_NOTES_EUDAMED_TRACE.md \
-              --latest=false
-          fi
+          # Recreate latest so it is shown as the newest release in GitHub's release list.
+          # Keep --latest=false so GitHub's green repository Latest marker is reserved for
+          # a future combined EUDAHUB platform release.
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag || true
 
-          for asset in \
-            eudamed_trace_latest.duckdb \
-            eudamed_trace_latest.metadata.json \
-            RELEASE_NOTES_EUDAMED_TRACE.md
-          do
-            gh release delete-asset "$TAG" "$asset" --repo "$REPO" --yes || true
-          done
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "$TITLE" \
+            --notes-file RELEASE_NOTES_EUDAMED_TRACE.md \
+            --latest=false
 
           gh release upload "$TAG" \
             eudamed_trace_latest.duckdb \
