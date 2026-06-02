@@ -277,4 +277,4 @@ jobs:
             *.metadata.json
             RELEASE_NOTES_EUDAMED_RAW.md
             RELEASE_NOTES_EUDAMED_TRACE.md
-          retention-days: 30
+          retention-days: 7
