@@ -1,4 +1,4 @@
-name: Pipeline EUDAMED UI Lab v4.5
+name: Pipeline EUDAMED UI Lab v4.6
 
 on:
   workflow_dispatch:
@@ -35,6 +35,14 @@ on:
         description: "Progress log interval in completed pages."
         required: false
         default: "50"
+      incremental_mismatch_probe_head_pages:
+        description: "Incremental mismatch probe pages from head."
+        required: false
+        default: "50"
+      incremental_mismatch_probe_tail_pages:
+        description: "Incremental mismatch probe pages from tail."
+        required: false
+        default: "50"
 
   schedule:
     # Daily full raw refresh at 02:00 UTC.
@@ -46,7 +54,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: eudamed-ui-lab-v4-5
+  group: eudamed-ui-lab-v4-6
   cancel-in-progress: false
 
 env:
@@ -57,7 +65,7 @@ env:
   PY_FILE: pipelines/eudamed_ui_lab/pipeline_eudamed_ui_lab.py
 
 jobs:
-  fetch-ui-raw-v4-5:
+  fetch-ui-raw-v4-6:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -77,6 +85,8 @@ jobs:
             DETAIL_WORKERS="${{ inputs.detail_workers }}"
             MAX_RPS="${{ inputs.max_rps }}"
             PROGRESS_EVERY="${{ inputs.progress_every }}"
+            PROBE_HEAD="${{ inputs.incremental_mismatch_probe_head_pages }}"
+            PROBE_TAIL="${{ inputs.incremental_mismatch_probe_tail_pages }}"
           elif [[ "${{ github.event.schedule }}" == "0 2 * * *" ]]; then
             MODE="full"
             PAGE_SIZE="300"
@@ -85,6 +95,8 @@ jobs:
             DETAIL_WORKERS="8"
             MAX_RPS="3"
             PROGRESS_EVERY="50"
+            PROBE_HEAD="50"
+            PROBE_TAIL="50"
           else
             MODE="incremental"
             PAGE_SIZE="300"
@@ -93,6 +105,8 @@ jobs:
             DETAIL_WORKERS="8"
             MAX_RPS="3"
             PROGRESS_EVERY="50"
+            PROBE_HEAD="50"
+            PROBE_TAIL="50"
           fi
 
           echo "MODE=$MODE" >> "$GITHUB_ENV"
@@ -105,6 +119,8 @@ jobs:
           echo "RUN_DATE=$(date -u +'%Y%m%d')" >> "$GITHUB_ENV"
           echo "DATED_TAG=eudamed-ui-lab-$(date -u +'%Y%m%d')" >> "$GITHUB_ENV"
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "probe_head=$PROBE_HEAD" >> "$GITHUB_OUTPUT"
+          echo "probe_tail=$PROBE_TAIL" >> "$GITHUB_OUTPUT"
           echo "Resolved mode=$MODE"
 
       - name: Set up Python
@@ -130,16 +146,16 @@ jobs:
           set +e
           gh release download "$LATEST_TAG" \
             --repo "$DATA_REPO" \
-            --pattern "eudamed_ui_lab_v4_5.duckdb.zip" \
+            --pattern "eudamed_ui_lab_v4_6.duckdb.zip" \
             --dir "$INPUT_DIR" \
             --clobber
           gh release download "$LATEST_TAG" \
             --repo "$DATA_REPO" \
-            --pattern "ui_api_state_v4_5.json" \
+            --pattern "ui_api_state_v4_6.json" \
             --dir "$INPUT_DIR" \
             --clobber
 
-          # First v4.5 run fallback: bootstrap from previous unversioned v4.3/latest asset.
+          # First v4.6 run fallback: bootstrap from previous unversioned v4.3/latest asset.
           gh release download "$LATEST_TAG" \
             --repo "$DATA_REPO" \
             --pattern "eudamed_ui_lab.duckdb.zip" \
@@ -148,7 +164,7 @@ jobs:
           set -e
           find "$INPUT_DIR" -maxdepth 1 -type f -print -exec ls -lh {} \;
 
-      - name: Run raw UI acquisition v4.5
+      - name: Run raw UI acquisition v4.6
         run: |
           python "$PY_FILE" \
             --mode "$MODE" \
@@ -166,6 +182,8 @@ jobs:
             --progress-every "$PROGRESS_EVERY" \
             --incremental-known-pages-to-stop 5 \
             --incremental-extra-pages-after-match 10 \
+            --incremental-mismatch-probe-head-pages "${{ steps.meta.outputs.probe_head }}" \
+            --incremental-mismatch-probe-tail-pages "${{ steps.meta.outputs.probe_tail }}" \
             --retries 4 \
             --backoff 1.5 \
             --timeout 60 \
@@ -184,7 +202,7 @@ jobs:
           python - <<'PY'
           import json
           from pathlib import Path
-          stats_path = Path('dist/eudamed_ui_lab/ui_api_test_stats_v4_5.json')
+          stats_path = Path('dist/eudamed_ui_lab/ui_api_test_stats_v4_6.json')
           stats = json.loads(stats_path.read_text(encoding='utf-8'))
           state = stats.get('state', {})
           expected = stats.get('expected', {})
@@ -192,19 +210,19 @@ jobs:
           pfa = stats.get('page_fetch_audit', {}) or {}
           mode = stats.get('mode')
           lines = [
-              '# EUDAMED UI Lab v4.5',
+              '# EUDAMED UI Lab v4.6',
               '',
               'Raw data acquisition release only. No CDC, DK subset or canonical transformations are produced here.',
               '',
               '## Key changes',
               '- Fixed EUDAMED zero-based pagination: page `0..totalPages-1`.',
-              '- Incremental mode is now the default.',
-              '- State bootstrap: use `ui_api_state_v4_5.json` when available; otherwise read latest raw DuckDB and calculate `max_ulid`.',
-              '- Incremental runs append new rows to the raw DB and stop only after a conservative known-ULID frontier check.
-              - v4.5 crawls extra known-only pages when API totalElements does not yet match old rows + appended rows.',
+              '- Incremental mode is the default.',
+              '- State bootstrap: use `ui_api_state_v4_6.json` when available; fallback to v4.5 state or latest raw DuckDB and calculate `max_ulid`.',
+              '- Incremental runs append new rows to the raw DB and stop after a conservative known-ULID frontier check.',
+              '- v4.6 adds mismatch probes: if `old_rows + new_rows != api_totalElements`, the pipeline probes the first 50 pages and the last 50 pages before accepting a warning.',
               '- Completeness mismatch is warning-only. The DB is still released so long runs are not lost.',
-              '- Added GitHub Actions concurrency so full and incremental do not write releases at the same time.',
-              '- Removed separate green/success release tag. Only latest and dated UI releases are maintained.',
+              '- GitHub Actions concurrency prevents full and incremental from writing releases at the same time.',
+              '- No separate green/success release tag. Only latest and dated UI releases are maintained.',
               '',
               '## Stats',
               f'- mode: `{mode}`',
@@ -217,11 +235,18 @@ jobs:
               f'- max ULID: `{state.get("max_ulid")}` → `{state.get("max_ulid_timestamp")}`',
           ]
           if mode == 'incremental':
+              probe = inc.get('mismatch_probe') or {}
               lines += [
                   f'- old rows: `{inc.get("old_rows")}`',
                   f'- new rows appended: `{inc.get("new_rows_appended")}`',
                   f'- pages fetched: `{inc.get("pages_fetched")}`',
                   f'- frontier reached: `{inc.get("frontier_reached")}`',
+                  f'- stop reason: `{inc.get("stop_reason")}`',
+                  f'- mismatch probe executed: `{probe.get("executed")}`',
+                  f'- head probe added rows: `{probe.get("head_probe_new_rows_added")}`',
+                  f'- tail probe added rows: `{probe.get("tail_probe_new_rows_added")}`',
+                  f'- difference after probe: `{probe.get("difference_after_probe")}`',
+                  f'- API drift suspected: `{probe.get("api_drift_suspected")}`',
               ]
           else:
               lines += [
@@ -233,13 +258,13 @@ jobs:
           lines += [
               '',
               '## Assets',
-              '- `eudamed_ui_lab_v4_5.duckdb.zip`',
-              '- `ui_api_test_stats_v4_5.json`',
-              '- `ui_api_state_v4_5.json`',
+              '- `eudamed_ui_lab_v4_6.duckdb.zip`',
+              '- `ui_api_test_stats_v4_6.json`',
+              '- `ui_api_state_v4_6.json`',
           ]
-          Path('dist/eudamed_ui_lab/RELEASE_NOTES_v4_5.md').write_text('\n'.join(lines), encoding='utf-8')
+          Path('dist/eudamed_ui_lab/RELEASE_NOTES_v4_6.md').write_text('\n'.join(lines), encoding='utf-8')
           PY
-          cat dist/eudamed_ui_lab/RELEASE_NOTES_v4_5.md
+          cat dist/eudamed_ui_lab/RELEASE_NOTES_v4_6.md
 
       - name: List generated files
         run: |
@@ -248,19 +273,19 @@ jobs:
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: eudamed-ui-lab-v4-5-${{ steps.meta.outputs.mode }}
+          name: eudamed-ui-lab-v4-6-${{ steps.meta.outputs.mode }}
           path: |
-            dist/eudamed_ui_lab/eudamed_ui_lab_v4_5.duckdb.zip
-            dist/eudamed_ui_lab/ui_api_test_stats_v4_5.json
-            dist/eudamed_ui_lab/ui_api_state_v4_5.json
-            dist/eudamed_ui_lab/RELEASE_NOTES_v4_5.md
+            dist/eudamed_ui_lab/eudamed_ui_lab_v4_6.duckdb.zip
+            dist/eudamed_ui_lab/ui_api_test_stats_v4_6.json
+            dist/eudamed_ui_lab/ui_api_state_v4_6.json
+            dist/eudamed_ui_lab/RELEASE_NOTES_v4_6.md
 
       - name: Update latest release in data repo
         env:
           GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         shell: bash
         run: |
-          NOTES="$OUT_DIR/RELEASE_NOTES_v4_5.md"
+          NOTES="$OUT_DIR/RELEASE_NOTES_v4_6.md"
 
           if ! gh release view "$LATEST_TAG" --repo "$DATA_REPO" >/dev/null 2>&1; then
             gh release create "$LATEST_TAG" \
@@ -277,9 +302,9 @@ jobs:
             --latest=false
 
           gh release upload "$LATEST_TAG" \
-            "$OUT_DIR/eudamed_ui_lab_v4_5.duckdb.zip" \
-            "$OUT_DIR/ui_api_test_stats_v4_5.json" \
-            "$OUT_DIR/ui_api_state_v4_5.json" \
+            "$OUT_DIR/eudamed_ui_lab_v4_6.duckdb.zip" \
+            "$OUT_DIR/ui_api_test_stats_v4_6.json" \
+            "$OUT_DIR/ui_api_state_v4_6.json" \
             --repo "$DATA_REPO" \
             --clobber
 
@@ -289,7 +314,7 @@ jobs:
           GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         shell: bash
         run: |
-          NOTES="$OUT_DIR/RELEASE_NOTES_v4_5.md"
+          NOTES="$OUT_DIR/RELEASE_NOTES_v4_6.md"
 
           if ! gh release view "$DATED_TAG" --repo "$DATA_REPO" >/dev/null 2>&1; then
             gh release create "$DATED_TAG" \
@@ -306,8 +331,8 @@ jobs:
             --latest=false
 
           gh release upload "$DATED_TAG" \
-            "$OUT_DIR/eudamed_ui_lab_v4_5.duckdb.zip" \
-            "$OUT_DIR/ui_api_test_stats_v4_5.json" \
-            "$OUT_DIR/ui_api_state_v4_5.json" \
+            "$OUT_DIR/eudamed_ui_lab_v4_6.duckdb.zip" \
+            "$OUT_DIR/ui_api_test_stats_v4_6.json" \
+            "$OUT_DIR/ui_api_state_v4_6.json" \
             --repo "$DATA_REPO" \
             --clobber
