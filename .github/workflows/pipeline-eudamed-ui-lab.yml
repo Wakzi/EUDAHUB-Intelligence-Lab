@@ -54,7 +54,7 @@ env:
   OUT_DIR: dist/eudamed_ui_lab
   INPUT_DIR: inputs
   LATEST_TAG: eudamed-ui-lab-latest
-  PY_FILE: pipelines/eudamed_ui_lab/pipeline_eudamed_ui_lab_v4_4.py
+  PY_FILE: pipelines/eudamed_ui_lab/pipeline_eudamed_ui_lab.py 
 
 jobs:
   fetch-ui-raw-v4-4:
