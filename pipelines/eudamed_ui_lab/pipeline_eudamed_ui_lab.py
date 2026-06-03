@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EUDAHUB EUDAMED UI API POC v4.3
+EUDAHUB EUDAMED UI API raw acquisition v4.4
 
 Purpose
 -------
@@ -49,6 +49,7 @@ import json
 import math
 import os
 import random
+import shutil
 import threading
 import time
 import zipfile
@@ -62,7 +63,9 @@ import pandas as pd
 import requests
 
 BASE_URL = "https://ec.europa.eu/tools/eudamed/api"
-DEFAULT_USER_AGENT = "EUDAHUB-Intelligence-EUDAMED-UI-API-Test/0.4.3"
+DEFAULT_USER_AGENT = "EUDAHUB-Intelligence-EUDAMED-UI-API-Raw/0.4.4"
+PIPELINE_VERSION = "v4.4"
+STATE_FILENAME = "ui_api_state_v4_4.json"
 
 
 # -----------------------------
@@ -414,13 +417,13 @@ class ApiClient:
 def discover_pages(client: ApiClient, page_size: int) -> Tuple[Dict[str, Any], ApiResult]:
     url = f"{BASE_URL}/devices/udiDiData"
     params = {
-        "page": 1,
+        "page": 0,
         "pageSize": page_size,
         "size": page_size,
         "iso2Code": client.language,
         "languageIso2Code": client.language,
     }
-    res = client.get_json("devices_udiDiData_discovery", url, params=params, page=1)
+    res = client.get_json("devices_udiDiData_discovery", url, params=params, page=0)
     data = res.data if isinstance(res.data, dict) else {}
 
     # EUDAMED response has top-level and pageable metadata in observed responses.
@@ -899,6 +902,169 @@ def df_from_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# -----------------------------
+# ULID/state helpers v4.4
+# -----------------------------
+
+CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+CROCKFORD_MAP = {c: i for i, c in enumerate(CROCKFORD_ALPHABET)}
+
+def decode_ulid_timestamp(ulid_value: Any) -> Optional[str]:
+    if not isinstance(ulid_value, str) or len(ulid_value) < 10:
+        return None
+    try:
+        n = 0
+        for ch in ulid_value[:10].upper():
+            n = (n << 5) | CROCKFORD_MAP[ch]
+        ms = n & ((1 << 48) - 1)
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+def latest_input_file(input_dir: Path) -> Optional[Path]:
+    patterns = [
+        "eudamed_ui_lab_v4_4.duckdb.zip",
+        "eudamed_ui_lab.duckdb.zip",
+        "*.duckdb.zip",
+        "eudamed_ui_lab_v4_4.duckdb",
+        "eudamed_ui_lab.duckdb",
+        "*.duckdb",
+    ]
+    files = []
+    for pat in patterns:
+        files.extend(input_dir.glob(pat))
+    files = [f for f in files if f.exists() and f.stat().st_size > 0]
+    return sorted(files, key=lambda f: f.stat().st_mtime, reverse=True)[0] if files else None
+
+def materialize_input_db(input_dir: Path) -> Optional[Path]:
+    src = latest_input_file(input_dir)
+    if not src:
+        return None
+    if src.suffix == ".zip":
+        with zipfile.ZipFile(src, "r") as zf:
+            names = [n for n in zf.namelist() if n.endswith(".duckdb")]
+            if not names:
+                return None
+            zf.extract(names[0], input_dir)
+            return input_dir / names[0]
+    return src
+
+def read_state(input_dir: Path) -> Dict[str, Any]:
+    for name in [STATE_FILENAME, "ui_api_state.json"]:
+        path = input_dir / name
+        if path.exists() and path.stat().st_size > 0:
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except Exception as e:
+                log(f"WARNING could not read state {path}: {e}")
+    return {}
+
+def read_previous_devices(input_dir: Path) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    db = materialize_input_db(input_dir)
+    if not db:
+        return pd.DataFrame(), {}
+    log(f"Previous raw DB found for bootstrap: {db}")
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        df = con.execute('SELECT * FROM ui_devices_list_all').fetch_df()
+    finally:
+        con.close()
+    if "ulid" in df.columns:
+        max_ulid = None if df.empty else df["ulid"].dropna().max()
+        min_ulid = None if df.empty else df["ulid"].dropna().min()
+    else:
+        max_ulid = min_ulid = None
+    state = {
+        "state_source": "db_bootstrap",
+        "bootstrap_db": str(db),
+        "row_count": int(len(df)),
+        "max_ulid": max_ulid,
+        "max_ulid_timestamp": decode_ulid_timestamp(max_ulid),
+        "min_ulid": min_ulid,
+        "min_ulid_timestamp": decode_ulid_timestamp(min_ulid),
+    }
+    return df, state
+
+def build_state_payload(mode: str, discovery: Dict[str, Any], devices_df: pd.DataFrame, audit: Dict[str, Any]) -> Dict[str, Any]:
+    max_ulid = devices_df["ulid"].dropna().max() if not devices_df.empty and "ulid" in devices_df.columns else None
+    min_ulid = devices_df["ulid"].dropna().min() if not devices_df.empty and "ulid" in devices_df.columns else None
+    total_pages = int(discovery.get("total_pages") or 0)
+    row_count = int(len(devices_df))
+    total_elements = int(discovery.get("total_elements") or 0)
+    return {
+        "pipeline_version": PIPELINE_VERSION,
+        "crawl_mode": mode,
+        "completed_at_utc": now_utc(),
+        "max_ulid": max_ulid,
+        "max_ulid_timestamp": decode_ulid_timestamp(max_ulid),
+        "min_ulid": min_ulid,
+        "min_ulid_timestamp": decode_ulid_timestamp(min_ulid),
+        "row_count": row_count,
+        "api_total_elements": total_elements,
+        "api_total_pages": total_pages,
+        "page_size": int(discovery.get("response_page_size") or discovery.get("requested_page_size") or 0),
+        "first_page": 0,
+        "last_page": total_pages - 1 if total_pages else None,
+        "first_page_first_flag": safe_get(json.loads(discovery.get("raw_metadata") or "{}"), "first"),
+        "first_page_last_flag": safe_get(json.loads(discovery.get("raw_metadata") or "{}"), "last"),
+        "first_page_number": safe_get(json.loads(discovery.get("raw_metadata") or "{}"), "number"),
+        "completeness_ratio": (row_count / total_elements) if total_elements else None,
+        "audit": audit,
+    }
+
+def fetch_incremental_pages(client: ApiClient, known_max_ulid: str, page_size: int, total_pages: int, known_pages_to_stop: int, extra_pages_after_match: int, old_count: int, api_total: int, progress_every: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    new_rows: List[Dict[str, Any]] = []
+    page_audit: List[Dict[str, Any]] = []
+    request_log: List[Dict[str, Any]] = []
+    raw_index: List[Dict[str, Any]] = []
+    known_pages = 0
+    fetched = 0
+    frontier_reached = False
+    page = 0
+    while page < total_pages:
+        result = fetch_one_device_page(client, page, page_size)
+        rows, audit, raw = parse_device_list_page(result)
+        page_audit.append(audit)
+        raw_index.append(raw)
+        request_log.append({
+            "endpoint": result.endpoint, "page": result.page, "url": result.url, "status_code": result.status_code,
+            "ok": result.ok, "duration_ms": result.duration_ms, "attempt": result.attempt, "error": result.error,
+        })
+        fetched += 1
+        page_new = [r for r in rows if str(r.get("ulid") or "") > known_max_ulid]
+        page_known = len(rows) - len(page_new)
+        new_rows.extend(page_new)
+        log(f"Incremental page={page} rows={len(rows)} new={len(page_new)} known_or_old={page_known}")
+        if page_known > 0 and len(page_new) == 0:
+            frontier_reached = True
+            known_pages += 1
+        elif page_known > 0 and len(page_new) > 0:
+            frontier_reached = True
+            known_pages = 1
+        else:
+            known_pages = 0
+        if old_count + len(new_rows) == api_total and known_pages >= extra_pages_after_match:
+            break
+        if frontier_reached and known_pages >= known_pages_to_stop:
+            if old_count + len(new_rows) != api_total:
+                log(f"WARNING incremental frontier reached but old+new={old_count + len(new_rows):,} api_total={api_total:,}; stopping because repeated known pages were found")
+            break
+        page += 1
+    audit = {
+        "mode": "incremental",
+        "known_max_ulid_before": known_max_ulid,
+        "known_max_ulid_before_timestamp": decode_ulid_timestamp(known_max_ulid),
+        "old_rows": old_count,
+        "api_total_elements": api_total,
+        "pages_fetched": fetched,
+        "new_rows_appended": len(new_rows),
+        "frontier_reached": frontier_reached,
+        "expected_after_append": old_count + len(new_rows),
+        "expected_after_append_minus_api_total": old_count + len(new_rows) - api_total,
+    }
+    return new_rows, page_audit, request_log, raw_index, audit
+
+
 def write_csv_zip(zip_path: Path, dfs: Dict[str, pd.DataFrame]) -> None:
     ensure_dir(zip_path.parent)
     with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
@@ -947,9 +1113,13 @@ def zip_file(src: Path, dst: Path) -> Optional[str]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", default="dist/eudamed_ui_lab")
+    parser.add_argument("--mode", choices=["incremental", "full"], default="incremental")
+    parser.add_argument("--input-dir", default="inputs")
+    parser.add_argument("--incremental-known-pages-to-stop", type=int, default=2)
+    parser.add_argument("--incremental-extra-pages-after-match", type=int, default=1)
     parser.add_argument("--language", default="en")
     parser.add_argument("--page-size", type=int, default=300)
-    parser.add_argument("--max-pages", type=int, default=1, help="0 = all pages discovered")
+    parser.add_argument("--max-pages", type=int, default=0, help="0 = all pages discovered")
     parser.add_argument("--max-device-detail", type=int, default=0, help="0=skip, -1=all fetched devices, >0 sample")
     parser.add_argument("--max-basic-udi", type=int, default=0, help="Reserved. 0=skip, -1=all candidates, >0 sample")
     parser.add_argument("--max-actor-detail", type=int, default=0, help="Reserved. 0=skip, -1=all candidates, >0 sample")
@@ -989,10 +1159,11 @@ def main() -> None:
         global_429_window=args.global_429_window,
     )
 
-    log("=== EUDAMED UI API v4.3 test started ===")
+    log(f"=== EUDAMED UI API {PIPELINE_VERSION} raw acquisition started ===")
     log(f"out_dir={out_dir}")
     log(f"page_size={args.page_size} max_pages={args.max_pages} max_rps={args.max_rps} workers={args.workers} detail_workers={args.detail_workers}")
-    log(f"details={args.max_device_detail} basic_udi={args.max_basic_udi} actor={args.max_actor_detail} retries={args.retries} backoff={args.backoff}s timeout={args.timeout}s")
+    log(f"mode={args.mode} details={args.max_device_detail} basic_udi={args.max_basic_udi} actor={args.max_actor_detail} retries={args.retries} backoff={args.backoff}s timeout={args.timeout}s")
+    log("scope=raw_fetch_only cdc=0 canonical=0 dk_subset=0")
 
     discovery, discovery_result = discover_pages(client, args.page_size)
     log("=== Discovery complete ===")
@@ -1005,19 +1176,48 @@ def main() -> None:
     if not discovery_result.ok or not expected_total_pages:
         raise RuntimeError(f"Discovery failed: {discovery}")
 
+    # v4.4: EUDAMED UI API uses zero-based pagination.
+    # Valid pages are 0..totalPages-1.
     if args.max_pages == 0:
-        pages = list(range(1, int(expected_total_pages) + 1))
+        pages = list(range(0, int(expected_total_pages)))
     else:
-        pages = list(range(1, min(int(args.max_pages), int(expected_total_pages)) + 1))
+        pages = list(range(0, min(int(args.max_pages), int(expected_total_pages))))
 
-    log(f"=== Fetching {len(pages):,} page(s) ===")
-    device_rows, page_audit, request_log, raw_index = fetch_device_pages_parallel(
-        client=client,
-        pages=pages,
-        page_size=args.page_size,
-        workers=args.workers,
-        progress_every=args.progress_every,
-    )
+    input_dir = Path(args.input_dir)
+    ensure_dir(input_dir)
+    incremental_audit: Dict[str, Any] = {}
+    previous_df = pd.DataFrame()
+
+    if args.mode == "incremental":
+        state_file = read_state(input_dir)
+        previous_df, db_state = read_previous_devices(input_dir)
+        known_max_ulid = state_file.get("max_ulid") or db_state.get("max_ulid")
+        if previous_df.empty or not known_max_ulid:
+            log("WARNING incremental requested but previous DB/max_ulid was not found. Falling back to full mode.")
+            args.mode = "full"
+        else:
+            log(f"=== Incremental from known max_ulid={known_max_ulid} ({decode_ulid_timestamp(known_max_ulid)}) ===")
+            device_rows, page_audit, request_log, raw_index, incremental_audit = fetch_incremental_pages(
+                client=client,
+                known_max_ulid=known_max_ulid,
+                page_size=args.page_size,
+                total_pages=int(expected_total_pages),
+                known_pages_to_stop=args.incremental_known_pages_to_stop,
+                extra_pages_after_match=args.incremental_extra_pages_after_match,
+                old_count=int(len(previous_df)),
+                api_total=int(expected_total_elements),
+                progress_every=args.progress_every,
+            )
+
+    if args.mode == "full":
+        log(f"=== Fetching {len(pages):,} page(s), zero-based {pages[0] if pages else 0}..{pages[-1] if pages else 0} ===")
+        device_rows, page_audit, request_log, raw_index = fetch_device_pages_parallel(
+            client=client,
+            pages=pages,
+            page_size=args.page_size,
+            workers=args.workers,
+            progress_every=args.progress_every,
+        )
 
     raw_json_lines: List[str] = []
     device_detail_rows: List[Dict[str, Any]] = []
@@ -1044,10 +1244,23 @@ def main() -> None:
     basic_udi_attempts: List[Dict[str, Any]] = []
     actor_attempts: List[Dict[str, Any]] = []
 
+    new_devices_df = df_from_rows(device_rows)
+    if args.mode == "incremental" and not previous_df.empty:
+        # Align columns and append only new rows to previous raw DB snapshot.
+        for col in previous_df.columns:
+            if col not in new_devices_df.columns:
+                new_devices_df[col] = pd.NA
+        for col in new_devices_df.columns:
+            if col not in previous_df.columns:
+                previous_df[col] = pd.NA
+        devices_all_df = pd.concat([previous_df, new_devices_df[previous_df.columns]], ignore_index=True)
+    else:
+        devices_all_df = new_devices_df
+
     dfs: Dict[str, pd.DataFrame] = {
         "ui_discovery": pd.DataFrame([discovery]),
         "ui_page_audit": df_from_rows(page_audit),
-        "ui_devices_list_all": df_from_rows(device_rows),
+        "ui_devices_list_all": devices_all_df,
         "ui_device_details_flat": df_from_rows(device_detail_rows),
         "ui_device_market_countries": df_from_rows(market_country_rows),
         "ui_basic_udi_attempts": df_from_rows(basic_udi_attempts),
@@ -1081,6 +1294,8 @@ def main() -> None:
 
     stats = {
         "generated_at_utc": now_utc(),
+        "pipeline_version": PIPELINE_VERSION,
+        "mode": args.mode,
         "base_url": BASE_URL,
         "language": args.language,
         "page_size_requested": args.page_size,
@@ -1106,6 +1321,8 @@ def main() -> None:
         "expected": {
             "total_elements": expected_total_elements,
             "total_pages": expected_total_pages,
+            "first_page": 0,
+            "last_page": int(expected_total_pages) - 1 if expected_total_pages else None,
         },
         "page_fetch_audit": {
             "requested_pages": requested_pages,
@@ -1121,6 +1338,8 @@ def main() -> None:
             "received_equals_expected_for_scope": received_rows == (expected_total_elements if args.max_pages == 0 else min(expected_total_elements, requested_pages * response_page_size)),
             "successful_pages_equals_requested_pages": successful_pages == requested_pages,
         },
+        "incremental_audit": incremental_audit,
+        "state": build_state_payload(args.mode, discovery, devices_df, incremental_audit or {"mode": "full"}),
         "detail_audit": {
             "device_detail_rows": int(len(detail_df)),
             "market_country_rows": int(len(market_df)),
@@ -1140,6 +1359,8 @@ def main() -> None:
         f"received_rows={received_rows:,} unique_uuid={unique_uuid:,} duplicate_uuid_rows={duplicate_uuid_rows:,} | "
         f"missing_pages={len(missing_pages):,}"
     )
+    if received_rows != (expected_total_elements if args.max_pages == 0 else min(expected_total_elements, requested_pages * response_page_size)):
+        log("WARNING completeness mismatch. This is warning-only in v4.4; raw DB will still be released.")
 
     # Write raw detail JSONL only if details were fetched; not zipped in CSV bundle, but useful in DB workflow if needed.
     raw_jsonl_path = out_dir / "ui_raw_detail_responses.jsonl"
@@ -1147,10 +1368,10 @@ def main() -> None:
         raw_jsonl_path.write_text("\n".join(raw_json_lines) + "\n", encoding="utf-8")
         stats["output_files"].append(raw_jsonl_path.name)
 
-    duckdb_path = out_dir / "eudamed_ui_lab.duckdb"
-    duckdb_zip_path = out_dir / "eudamed_ui_lab.duckdb.zip"
-    csv_zip_path = out_dir / "eudamed_ui_lab_csv.zip"
-    stats_path = out_dir / "ui_api_test_stats.json"
+    duckdb_path = out_dir / "eudamed_ui_lab_v4_4.duckdb"
+    duckdb_zip_path = out_dir / "eudamed_ui_lab_v4_4.duckdb.zip"
+    csv_zip_path = out_dir / "eudamed_ui_lab_csv_v4_4.zip"
+    stats_path = out_dir / "ui_api_test_stats_v4_4.json"
 
     log(f"Writing DuckDB export: {duckdb_path}")
     export_started = time.monotonic()
@@ -1187,6 +1408,11 @@ def main() -> None:
         stats["csv_zip_skipped"] = False
         stats["output_files"].append(csv_zip_path.name)
 
+    # State is deliberately unzipped.
+    state_path = out_dir / STATE_FILENAME
+    state_path.write_text(json.dumps(stats["state"], indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    stats["output_files"].append(state_path.name)
+
     # Stats are deliberately unzipped.
     stats["output_files"].append(stats_path.name)
     stats["output_file_sizes"] = {
@@ -1201,7 +1427,7 @@ def main() -> None:
 
     log("=== Final stats ===")
     log(json.dumps(stats, ensure_ascii=False, default=str))
-    log("=== Done ===")
+    log(f"=== Done {PIPELINE_VERSION} ===")
 
 
 if __name__ == "__main__":
