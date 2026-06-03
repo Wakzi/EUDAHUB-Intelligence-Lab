@@ -150,6 +150,8 @@ jobs:
             --max-rps 3.0
             --retries 4
             --backoff 1.5
+            --discovery-retries 8
+            --discovery-retry-pause 30
             --release-timestamp "${{ steps.meta.outputs.release_ts }}"
           )
           if [ "${{ steps.meta.outputs.skip_csv_zip }}" = "true" ]; then
