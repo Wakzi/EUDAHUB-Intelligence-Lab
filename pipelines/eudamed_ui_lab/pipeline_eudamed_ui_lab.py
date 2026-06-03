@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EUDAHUB EUDAMED UI API raw acquisition v4.5
+EUDAHUB EUDAMED UI API raw acquisition v4.6
 
 Purpose
 -------
@@ -64,8 +64,8 @@ import requests
 
 BASE_URL = "https://ec.europa.eu/tools/eudamed/api"
 DEFAULT_USER_AGENT = "EUDAHUB-Intelligence-EUDAMED-UI-API-Raw/0.4.4"
-PIPELINE_VERSION = "v4.5"
-STATE_FILENAME = "ui_api_state_v4_5.json"
+PIPELINE_VERSION = "v4.6"
+STATE_FILENAME = "ui_api_state_v4_6.json"
 
 
 # -----------------------------
@@ -923,10 +923,10 @@ def decode_ulid_timestamp(ulid_value: Any) -> Optional[str]:
 
 def latest_input_file(input_dir: Path) -> Optional[Path]:
     patterns = [
-        "eudamed_ui_lab_v4_5.duckdb.zip",
+        "eudamed_ui_lab_v4_6.duckdb.zip",
         "eudamed_ui_lab.duckdb.zip",
         "*.duckdb.zip",
-        "eudamed_ui_lab_v4_5.duckdb",
+        "eudamed_ui_lab_v4_6.duckdb",
         "eudamed_ui_lab.duckdb",
         "*.duckdb",
     ]
@@ -950,7 +950,7 @@ def materialize_input_db(input_dir: Path) -> Optional[Path]:
     return src
 
 def read_state(input_dir: Path) -> Dict[str, Any]:
-    for name in [STATE_FILENAME, "ui_api_state.json"]:
+    for name in [STATE_FILENAME, "ui_api_state_v4_5.json", "ui_api_state.json"]:
         path = input_dir / name
         if path.exists() and path.stat().st_size > 0:
             try:
@@ -1012,15 +1012,17 @@ def build_state_payload(mode: str, discovery: Dict[str, Any], devices_df: pd.Dat
         "audit": audit,
     }
 
-def fetch_incremental_pages(client: ApiClient, known_max_ulid: str, page_size: int, total_pages: int, known_pages_to_stop: int, extra_pages_after_match: int, old_count: int, api_total: int, progress_every: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+def fetch_incremental_pages(client: ApiClient, known_max_ulid: str, page_size: int, total_pages: int, known_pages_to_stop: int, extra_pages_after_match: int, old_count: int, api_total: int, progress_every: int, mismatch_probe_head_pages: int = 50, mismatch_probe_tail_pages: int = 50) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     """Fetch only the newest frontier.
 
-    v4.5 is deliberately conservative: after the first known ULID frontier, it does
-    not stop on the first known-only page. It requires several consecutive
-    known-only pages, and if API totalElements still does not match old+new it
-    crawls extra known-only pages before stopping.
+    v4.6 is deliberately conservative. After the first known ULID frontier, it
+    requires several consecutive known-only pages. If old+new still differs from
+    API totalElements after the frontier, it probes both ends of the API result
+    set: page 0..N and last N pages. This gives evidence before accepting an
+    API-total drift warning.
     """
     new_rows: List[Dict[str, Any]] = []
+    seen_new_uuids = set()
     page_audit: List[Dict[str, Any]] = []
     request_log: List[Dict[str, Any]] = []
     raw_index: List[Dict[str, Any]] = []
@@ -1040,8 +1042,14 @@ def fetch_incremental_pages(client: ApiClient, known_max_ulid: str, page_size: i
             "ok": result.ok, "duration_ms": result.duration_ms, "attempt": result.attempt, "error": result.error,
         })
         fetched += 1
-        page_new = [r for r in rows if str(r.get("ulid") or "") > known_max_ulid]
-        page_known = len(rows) - len(page_new)
+        page_new_raw = [r for r in rows if str(r.get("ulid") or "") > known_max_ulid]
+        page_new = []
+        for r in page_new_raw:
+            key = str(r.get("uuid") or r.get("primaryDi") or r.get("ulid") or "")
+            if key and key not in seen_new_uuids:
+                seen_new_uuids.add(key)
+                page_new.append(r)
+        page_known = len(rows) - len(page_new_raw)
         new_rows.extend(page_new)
         if page_known > 0:
             frontier_reached = True
@@ -1076,6 +1084,96 @@ def fetch_incremental_pages(client: ApiClient, known_max_ulid: str, page_size: i
     if stop_reason is None:
         stop_reason = "end_of_pages" if page >= total_pages else "unknown"
 
+    mismatch_probe: Dict[str, Any] = {
+        "executed": False,
+        "head_probe_pages_requested": int(mismatch_probe_head_pages),
+        "tail_probe_pages_requested": int(mismatch_probe_tail_pages),
+        "head_probe_pages_fetched": 0,
+        "tail_probe_pages_fetched": 0,
+        "head_probe_new_rows": 0,
+        "tail_probe_new_rows": 0,
+        "head_probe_new_rows_added": 0,
+        "tail_probe_new_rows_added": 0,
+        "tail_first_page": None,
+        "tail_last_page": None,
+        "tail_last_page_rows": None,
+        "difference_before_probe": old_count + len(new_rows) - api_total,
+        "difference_after_probe": None,
+        "api_drift_suspected": False,
+    }
+
+    # v4.6: If incremental count does not match API total after frontier, probe
+    # both endpoints before accepting a warning. This is intentionally warning-only.
+    if api_total and (old_count + len(new_rows) != api_total):
+        mismatch_probe["executed"] = True
+        log(
+            f"WARNING incremental count mismatch before probe: "
+            f"old+new={old_count + len(new_rows):,} api_total={api_total:,} "
+            f"diff={old_count + len(new_rows) - api_total:,}. Probing head/tail pages."
+        )
+
+        fetched_pages = set(a.get("page") for a in page_audit if a.get("page") is not None)
+
+        def probe_page_range(label: str, probe_pages: List[int]) -> Tuple[int, int, Optional[int]]:
+            raw_new = 0
+            added_new = 0
+            last_rows = None
+            for probe_page in probe_pages:
+                result = fetch_one_device_page(client, probe_page, page_size)
+                rows, audit_row, raw = parse_device_list_page(result)
+                page_audit.append(audit_row)
+                raw_index.append(raw)
+                request_log.append({
+                    "endpoint": result.endpoint, "page": result.page, "url": result.url, "status_code": result.status_code,
+                    "ok": result.ok, "duration_ms": result.duration_ms, "attempt": result.attempt, "error": result.error,
+                    "probe": label,
+                })
+                last_rows = len(rows)
+                page_new_raw = [r for r in rows if str(r.get("ulid") or "") > known_max_ulid]
+                raw_new += len(page_new_raw)
+                local_added = 0
+                for r in page_new_raw:
+                    key = str(r.get("uuid") or r.get("primaryDi") or r.get("ulid") or "")
+                    if key and key not in seen_new_uuids:
+                        seen_new_uuids.add(key)
+                        new_rows.append(r)
+                        local_added += 1
+                added_new += local_added
+                log(f"Incremental {label} probe page={probe_page} rows={len(rows)} raw_new={len(page_new_raw)} added_new={local_added}")
+            return raw_new, added_new, last_rows
+
+        head_pages = list(range(0, min(int(mismatch_probe_head_pages), int(total_pages))))
+        if head_pages:
+            raw_new, added_new, _ = probe_page_range("head", head_pages)
+            mismatch_probe["head_probe_pages_fetched"] = len(head_pages)
+            mismatch_probe["head_probe_new_rows"] = raw_new
+            mismatch_probe["head_probe_new_rows_added"] = added_new
+
+        if api_total and (old_count + len(new_rows) != api_total):
+            tail_start = max(0, int(total_pages) - int(mismatch_probe_tail_pages))
+            tail_pages = list(range(tail_start, int(total_pages)))
+            if tail_pages:
+                raw_new, added_new, last_rows = probe_page_range("tail", tail_pages)
+                mismatch_probe["tail_probe_pages_fetched"] = len(tail_pages)
+                mismatch_probe["tail_probe_new_rows"] = raw_new
+                mismatch_probe["tail_probe_new_rows_added"] = added_new
+                mismatch_probe["tail_first_page"] = tail_pages[0]
+                mismatch_probe["tail_last_page"] = tail_pages[-1]
+                mismatch_probe["tail_last_page_rows"] = last_rows
+
+        mismatch_probe["difference_after_probe"] = old_count + len(new_rows) - api_total
+        mismatch_probe["api_drift_suspected"] = (
+            mismatch_probe["head_probe_new_rows_added"] == 0
+            and mismatch_probe["tail_probe_new_rows_added"] == 0
+            and abs(int(mismatch_probe["difference_after_probe"] or 0)) <= int(page_size)
+        )
+        log(
+            f"Incremental mismatch probe complete | head_added={mismatch_probe['head_probe_new_rows_added']} "
+            f"tail_added={mismatch_probe['tail_probe_new_rows_added']} "
+            f"diff_after={mismatch_probe['difference_after_probe']} "
+            f"api_drift_suspected={mismatch_probe['api_drift_suspected']}"
+        )
+
     audit = {
         "mode": "incremental",
         "known_max_ulid_before": known_max_ulid,
@@ -1089,7 +1187,10 @@ def fetch_incremental_pages(client: ApiClient, known_max_ulid: str, page_size: i
         "consecutive_known_only_pages_at_stop": consecutive_known_only_pages,
         "known_pages_to_stop": known_pages_to_stop,
         "extra_pages_after_match": extra_pages_after_match,
+        "mismatch_probe_head_pages": mismatch_probe_head_pages,
+        "mismatch_probe_tail_pages": mismatch_probe_tail_pages,
         "stop_reason": stop_reason,
+        "mismatch_probe": mismatch_probe,
         "expected_after_append": old_count + len(new_rows),
         "expected_after_append_minus_api_total": old_count + len(new_rows) - api_total,
     }
@@ -1148,6 +1249,8 @@ def main() -> None:
     parser.add_argument("--input-dir", default="inputs")
     parser.add_argument("--incremental-known-pages-to-stop", type=int, default=5, help="Stop incremental only after this many consecutive known-only pages")
     parser.add_argument("--incremental-extra-pages-after-match", type=int, default=10, help="If row count still differs from API total after frontier, crawl this many extra known-only pages before stopping")
+    parser.add_argument("--incremental-mismatch-probe-head-pages", type=int, default=50, help="If incremental count mismatches API total, re-probe this many pages from page 0")
+    parser.add_argument("--incremental-mismatch-probe-tail-pages", type=int, default=50, help="If incremental count mismatches API total, probe this many pages from the API tail")
     parser.add_argument("--language", default="en")
     parser.add_argument("--page-size", type=int, default=300)
     parser.add_argument("--max-pages", type=int, default=0, help="0 = all pages discovered")
@@ -1235,6 +1338,8 @@ def main() -> None:
                 total_pages=int(expected_total_pages),
                 known_pages_to_stop=args.incremental_known_pages_to_stop,
                 extra_pages_after_match=args.incremental_extra_pages_after_match,
+                mismatch_probe_head_pages=args.incremental_mismatch_probe_head_pages,
+                mismatch_probe_tail_pages=args.incremental_mismatch_probe_tail_pages,
                 old_count=int(len(previous_df)),
                 api_total=int(expected_total_elements),
                 progress_every=args.progress_every,
@@ -1400,7 +1505,7 @@ def main() -> None:
         f"missing_pages={len(missing_pages):,}"
     )
     if received_rows != (expected_total_elements if args.max_pages == 0 else min(expected_total_elements, requested_pages * response_page_size)):
-        log("WARNING completeness mismatch. This is warning-only in v4.5; raw DB will still be released.")
+        log("WARNING completeness mismatch. This is warning-only in v4.6; raw DB will still be released.")
 
     # Write raw detail JSONL only if details were fetched; not zipped in CSV bundle, but useful in DB workflow if needed.
     raw_jsonl_path = out_dir / "ui_raw_detail_responses.jsonl"
@@ -1408,10 +1513,10 @@ def main() -> None:
         raw_jsonl_path.write_text("\n".join(raw_json_lines) + "\n", encoding="utf-8")
         stats["output_files"].append(raw_jsonl_path.name)
 
-    duckdb_path = out_dir / "eudamed_ui_lab_v4_5.duckdb"
-    duckdb_zip_path = out_dir / "eudamed_ui_lab_v4_5.duckdb.zip"
-    csv_zip_path = out_dir / "eudamed_ui_lab_csv_v4_5.zip"
-    stats_path = out_dir / "ui_api_test_stats_v4_5.json"
+    duckdb_path = out_dir / "eudamed_ui_lab_v4_6.duckdb"
+    duckdb_zip_path = out_dir / "eudamed_ui_lab_v4_6.duckdb.zip"
+    csv_zip_path = out_dir / "eudamed_ui_lab_csv_v4_6.zip"
+    stats_path = out_dir / "ui_api_test_stats_v4_6.json"
 
     log(f"Writing DuckDB export: {duckdb_path}")
     export_started = time.monotonic()
