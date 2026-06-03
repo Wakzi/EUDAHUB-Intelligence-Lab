@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EUDAHUB EUDAMED UI API raw acquisition v4.4
+EUDAHUB EUDAMED UI API raw acquisition v4.5
 
 Purpose
 -------
@@ -64,8 +64,8 @@ import requests
 
 BASE_URL = "https://ec.europa.eu/tools/eudamed/api"
 DEFAULT_USER_AGENT = "EUDAHUB-Intelligence-EUDAMED-UI-API-Raw/0.4.4"
-PIPELINE_VERSION = "v4.4"
-STATE_FILENAME = "ui_api_state_v4_4.json"
+PIPELINE_VERSION = "v4.5"
+STATE_FILENAME = "ui_api_state_v4_5.json"
 
 
 # -----------------------------
@@ -903,7 +903,7 @@ def df_from_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
 
 # -----------------------------
-# ULID/state helpers v4.4
+# ULID/state helpers v4.5
 # -----------------------------
 
 CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -923,10 +923,10 @@ def decode_ulid_timestamp(ulid_value: Any) -> Optional[str]:
 
 def latest_input_file(input_dir: Path) -> Optional[Path]:
     patterns = [
-        "eudamed_ui_lab_v4_4.duckdb.zip",
+        "eudamed_ui_lab_v4_5.duckdb.zip",
         "eudamed_ui_lab.duckdb.zip",
         "*.duckdb.zip",
-        "eudamed_ui_lab_v4_4.duckdb",
+        "eudamed_ui_lab_v4_5.duckdb",
         "eudamed_ui_lab.duckdb",
         "*.duckdb",
     ]
@@ -1013,13 +1013,22 @@ def build_state_payload(mode: str, discovery: Dict[str, Any], devices_df: pd.Dat
     }
 
 def fetch_incremental_pages(client: ApiClient, known_max_ulid: str, page_size: int, total_pages: int, known_pages_to_stop: int, extra_pages_after_match: int, old_count: int, api_total: int, progress_every: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Fetch only the newest frontier.
+
+    v4.5 is deliberately conservative: after the first known ULID frontier, it does
+    not stop on the first known-only page. It requires several consecutive
+    known-only pages, and if API totalElements still does not match old+new it
+    crawls extra known-only pages before stopping.
+    """
     new_rows: List[Dict[str, Any]] = []
     page_audit: List[Dict[str, Any]] = []
     request_log: List[Dict[str, Any]] = []
     raw_index: List[Dict[str, Any]] = []
-    known_pages = 0
+    consecutive_known_only_pages = 0
+    known_or_mixed_pages_seen = 0
     fetched = 0
     frontier_reached = False
+    stop_reason = None
     page = 0
     while page < total_pages:
         result = fetch_one_device_page(client, page, page_size)
@@ -1034,22 +1043,39 @@ def fetch_incremental_pages(client: ApiClient, known_max_ulid: str, page_size: i
         page_new = [r for r in rows if str(r.get("ulid") or "") > known_max_ulid]
         page_known = len(rows) - len(page_new)
         new_rows.extend(page_new)
-        log(f"Incremental page={page} rows={len(rows)} new={len(page_new)} known_or_old={page_known}")
+        if page_known > 0:
+            frontier_reached = True
+            known_or_mixed_pages_seen += 1
         if page_known > 0 and len(page_new) == 0:
-            frontier_reached = True
-            known_pages += 1
-        elif page_known > 0 and len(page_new) > 0:
-            frontier_reached = True
-            known_pages = 1
+            consecutive_known_only_pages += 1
         else:
-            known_pages = 0
-        if old_count + len(new_rows) == api_total and known_pages >= extra_pages_after_match:
+            consecutive_known_only_pages = 0
+        current_total = old_count + len(new_rows)
+        diff = current_total - api_total
+        log(
+            f"Incremental page={page} rows={len(rows)} new={len(page_new)} "
+            f"known_or_old={page_known} known_only_streak={consecutive_known_only_pages} "
+            f"old_plus_new={current_total:,} api_total={api_total:,} diff={diff:,}"
+        )
+
+        if frontier_reached and current_total >= api_total and consecutive_known_only_pages >= known_pages_to_stop:
+            stop_reason = "frontier_reached_and_total_matched"
             break
-        if frontier_reached and known_pages >= known_pages_to_stop:
-            if old_count + len(new_rows) != api_total:
-                log(f"WARNING incremental frontier reached but old+new={old_count + len(new_rows):,} api_total={api_total:,}; stopping because repeated known pages were found")
+
+        if frontier_reached and consecutive_known_only_pages >= (known_pages_to_stop + extra_pages_after_match):
+            stop_reason = "frontier_reached_extra_known_pages_exhausted"
+            if current_total != api_total:
+                log(
+                    f"WARNING incremental frontier reached after extra pages but "
+                    f"old+new={current_total:,} api_total={api_total:,}; stopping because repeated known-only pages were found"
+                )
             break
+
         page += 1
+
+    if stop_reason is None:
+        stop_reason = "end_of_pages" if page >= total_pages else "unknown"
+
     audit = {
         "mode": "incremental",
         "known_max_ulid_before": known_max_ulid,
@@ -1059,6 +1085,11 @@ def fetch_incremental_pages(client: ApiClient, known_max_ulid: str, page_size: i
         "pages_fetched": fetched,
         "new_rows_appended": len(new_rows),
         "frontier_reached": frontier_reached,
+        "known_or_mixed_pages_seen": known_or_mixed_pages_seen,
+        "consecutive_known_only_pages_at_stop": consecutive_known_only_pages,
+        "known_pages_to_stop": known_pages_to_stop,
+        "extra_pages_after_match": extra_pages_after_match,
+        "stop_reason": stop_reason,
         "expected_after_append": old_count + len(new_rows),
         "expected_after_append_minus_api_total": old_count + len(new_rows) - api_total,
     }
@@ -1115,8 +1146,8 @@ def main() -> None:
     parser.add_argument("--out-dir", default="dist/eudamed_ui_lab")
     parser.add_argument("--mode", choices=["incremental", "full"], default="incremental")
     parser.add_argument("--input-dir", default="inputs")
-    parser.add_argument("--incremental-known-pages-to-stop", type=int, default=2)
-    parser.add_argument("--incremental-extra-pages-after-match", type=int, default=1)
+    parser.add_argument("--incremental-known-pages-to-stop", type=int, default=5, help="Stop incremental only after this many consecutive known-only pages")
+    parser.add_argument("--incremental-extra-pages-after-match", type=int, default=10, help="If row count still differs from API total after frontier, crawl this many extra known-only pages before stopping")
     parser.add_argument("--language", default="en")
     parser.add_argument("--page-size", type=int, default=300)
     parser.add_argument("--max-pages", type=int, default=0, help="0 = all pages discovered")
@@ -1176,7 +1207,7 @@ def main() -> None:
     if not discovery_result.ok or not expected_total_pages:
         raise RuntimeError(f"Discovery failed: {discovery}")
 
-    # v4.4: EUDAMED UI API uses zero-based pagination.
+    # v4.5: EUDAMED UI API uses zero-based pagination.
     # Valid pages are 0..totalPages-1.
     if args.max_pages == 0:
         pages = list(range(0, int(expected_total_pages)))
@@ -1281,11 +1312,20 @@ def main() -> None:
 
     successful_pages = int(page_df["ok"].sum()) if not page_df.empty and "ok" in page_df.columns else 0
     failed_pages = int((~page_df["ok"].astype(bool)).sum()) if not page_df.empty and "ok" in page_df.columns else 0
-    requested_pages = len(pages)
+    # For full runs, requested_pages means the full discovered API scope.
+    # For incremental runs, requested_pages means pages fetched in this run only;
+    # non-fetched older pages are not missing pages.
+    if args.mode == "incremental":
+        requested_pages = int(len(page_df))
+        fetched_scope_pages = set(page_df["page"].dropna().astype(int).tolist()) if not page_df.empty and "page" in page_df.columns else set()
+    else:
+        requested_pages = len(pages)
+        fetched_scope_pages = set(pages)
     received_rows = int(len(devices_df))
     unique_uuid = int(devices_df["uuid"].nunique()) if not devices_df.empty and "uuid" in devices_df.columns else 0
     duplicate_uuid_rows = int(received_rows - unique_uuid) if unique_uuid else 0
-    missing_pages = sorted(set(pages) - set(page_df.loc[page_df["ok"] == True, "page"].dropna().astype(int).tolist())) if not page_df.empty and "page" in page_df.columns else pages
+    ok_pages = set(page_df.loc[page_df["ok"] == True, "page"].dropna().astype(int).tolist()) if not page_df.empty and "page" in page_df.columns else set()
+    missing_pages = sorted(fetched_scope_pages - ok_pages)
 
     status_summary = []
     if not request_df.empty and "endpoint" in request_df.columns:
@@ -1360,7 +1400,7 @@ def main() -> None:
         f"missing_pages={len(missing_pages):,}"
     )
     if received_rows != (expected_total_elements if args.max_pages == 0 else min(expected_total_elements, requested_pages * response_page_size)):
-        log("WARNING completeness mismatch. This is warning-only in v4.4; raw DB will still be released.")
+        log("WARNING completeness mismatch. This is warning-only in v4.5; raw DB will still be released.")
 
     # Write raw detail JSONL only if details were fetched; not zipped in CSV bundle, but useful in DB workflow if needed.
     raw_jsonl_path = out_dir / "ui_raw_detail_responses.jsonl"
@@ -1368,10 +1408,10 @@ def main() -> None:
         raw_jsonl_path.write_text("\n".join(raw_json_lines) + "\n", encoding="utf-8")
         stats["output_files"].append(raw_jsonl_path.name)
 
-    duckdb_path = out_dir / "eudamed_ui_lab_v4_4.duckdb"
-    duckdb_zip_path = out_dir / "eudamed_ui_lab_v4_4.duckdb.zip"
-    csv_zip_path = out_dir / "eudamed_ui_lab_csv_v4_4.zip"
-    stats_path = out_dir / "ui_api_test_stats_v4_4.json"
+    duckdb_path = out_dir / "eudamed_ui_lab_v4_5.duckdb"
+    duckdb_zip_path = out_dir / "eudamed_ui_lab_v4_5.duckdb.zip"
+    csv_zip_path = out_dir / "eudamed_ui_lab_csv_v4_5.zip"
+    stats_path = out_dir / "ui_api_test_stats_v4_5.json"
 
     log(f"Writing DuckDB export: {duckdb_path}")
     export_started = time.monotonic()
