@@ -49,7 +49,7 @@ import pandas as pd
 import requests
 
 
-PIPELINE_VERSION = "v4.7"
+PIPELINE_VERSION = "v4.7.1"
 BASE_URL_DEFAULT = "https://ec.europa.eu/tools/eudamed/api"
 UDI_ENDPOINT = "/devices/udiDiData"
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -735,6 +735,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--timeout", type=int, default=60)
     p.add_argument("--retries", type=int, default=4)
     p.add_argument("--backoff", type=float, default=1.5)
+    p.add_argument("--discovery-retries", type=int, default=8)
+    p.add_argument("--discovery-retry-pause", type=float, default=30.0)
     p.add_argument("--known-pages-to-stop", type=int, default=5)
     p.add_argument("--extra-pages-after-match", type=int, default=10)
     p.add_argument("--mismatch-probe-head-pages", type=int, default=50)
@@ -754,19 +756,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(f"mode={args.mode} out_dir={out_dir} page_size={args.page_size}")
     log("scope=raw_fetch_only cdc=0 canonical=0 dk_subset=0 domain=udi")
 
-    client = EudamedClient(args.base_url, args.language, args.page_size, args.timeout, args.retries, args.backoff, args.max_rps)
-    discovery = client.discover()
-    log("=== Discovery complete ===")
-    log(json.dumps(discovery, ensure_ascii=False))
-    if not discovery.get("first_page_ok"):
-        log("ERROR discovery failed")
-        return 2
-
-    total_elements = int(discovery.get("total_elements") or 0)
-    total_pages = int(discovery.get("total_pages") or 0)
-    if args.max_pages and args.max_pages > 0:
-        total_pages = min(total_pages, args.max_pages)
-
+    # Bootstrap state/DB before API discovery so transient EU web-filter failures do not hard-fail a run.
     previous_state = read_state_file(inputs_dir)
     existing_db = find_existing_db(inputs_dir)
     existing_rows: List[Dict[str, Any]] = []
@@ -775,9 +765,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"Previous raw DB found for bootstrap: {existing_db}")
         bootstrap = bootstrap_from_db(existing_db)
         log(json.dumps(bootstrap, ensure_ascii=False))
-        if args.mode == "incremental":
-            existing_rows = read_existing_rows(existing_db)
-            log(f"Loaded existing rows: {len(existing_rows):,}")
+        # Load rows for incremental append and for no-op fallback if discovery is blocked.
+        existing_rows = read_existing_rows(existing_db)
+        log(f"Loaded existing rows: {len(existing_rows):,}")
 
     known_max = None
     if previous_state and previous_state.get("max_ulid"):
@@ -787,19 +777,83 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         known_max = bootstrap.get("max_ulid")
         log(f"Using max_ulid from DB: {known_max} ({decode_ulid(known_max)})")
 
-    if args.mode == "incremental" and not known_max:
-        log("WARNING no max_ulid found; fallback to full mode")
-        args.mode = "full"
+    client = EudamedClient(args.base_url, args.language, args.page_size, args.timeout, args.retries, args.backoff, args.max_rps)
+    discovery = None
+    for attempt in range(1, args.discovery_retries + 1):
+        discovery = client.discover()
+        log(f"=== Discovery attempt {attempt}/{args.discovery_retries} ===")
+        log(json.dumps(discovery, ensure_ascii=False))
+        if discovery.get("first_page_ok"):
+            break
+        if attempt < args.discovery_retries:
+            sleep_s = args.discovery_retry_pause * attempt
+            log(f"WARNING discovery failed; retrying in {sleep_s:.0f}s")
+            time.sleep(sleep_s)
 
-    if args.mode == "full":
-        rows, page_audit, request_log = fetch_full(client, total_pages, args.workers, extract_ts)
-        incremental_audit = None
+    discovery_failed = not (discovery and discovery.get("first_page_ok"))
+    if discovery_failed:
+        log("WARNING discovery failed after retries")
+        if not existing_rows:
+            log("ERROR discovery failed and no previous DB/state rows are available")
+            return 2
+        # No-op fallback: release the previous DB content with warning metadata instead of failing.
+        fallback_total = int((previous_state or {}).get("api_total_elements") or bootstrap.get("row_count") or len(existing_rows))
+        fallback_pages = int((previous_state or {}).get("api_total_pages") or 0)
+        discovery = {
+            "discovered_at_utc": iso_utc_now(),
+            "requested_page_size": args.page_size,
+            "response_page_size": None,
+            "total_elements": fallback_total,
+            "total_pages": fallback_pages,
+            "first_page_number_of_elements": None,
+            "first_page_content_length": 0,
+            "first_page_status_code": None,
+            "first_page_ok": False,
+            "first_page_first_flag": None,
+            "first_page_last_flag": None,
+            "first_page_number": None,
+            "raw_metadata": None,
+            "first_page_error": "Discovery failed after retries; reused previous raw DB content.",
+        }
+        total_elements = fallback_total
+        total_pages = fallback_pages
+        rows = existing_rows
+        page_audit = []
+        request_log = []
+        incremental_audit = {
+            "mode": args.mode,
+            "known_max_ulid_before": known_max,
+            "known_max_ulid_before_timestamp": decode_ulid(known_max),
+            "old_rows": len(existing_rows),
+            "api_total_elements": total_elements,
+            "pages_fetched": 0,
+            "new_rows_appended": 0,
+            "frontier_reached": False,
+            "stop_reason": "discovery_failed_noop_reuse_previous_db",
+            "expected_after_append": len(existing_rows),
+            "expected_after_append_minus_api_total": len(existing_rows) - total_elements,
+            "discovery_failed": True,
+        }
     else:
-        rows, page_audit, request_log, incremental_audit = fetch_incremental(
-            client, existing_rows, known_max, total_elements, total_pages, extract_ts,
-            args.known_pages_to_stop, args.extra_pages_after_match,
-            args.mismatch_probe_head_pages, args.mismatch_probe_tail_pages,
-        )
+        log("=== Discovery complete ===")
+        total_elements = int(discovery.get("total_elements") or 0)
+        total_pages = int(discovery.get("total_pages") or 0)
+        if args.max_pages and args.max_pages > 0:
+            total_pages = min(total_pages, args.max_pages)
+
+        if args.mode == "incremental" and not known_max:
+            log("WARNING no max_ulid found; fallback to full mode")
+            args.mode = "full"
+
+        if args.mode == "full":
+            rows, page_audit, request_log = fetch_full(client, total_pages, args.workers, extract_ts)
+            incremental_audit = None
+        else:
+            rows, page_audit, request_log, incremental_audit = fetch_incremental(
+                client, existing_rows, known_max, total_elements, total_pages, extract_ts,
+                args.known_pages_to_stop, args.extra_pages_after_match,
+                args.mismatch_probe_head_pages, args.mismatch_probe_tail_pages,
+            )
 
     rows = dedupe_by_uuid(rows)
     row_count = len(rows)
@@ -874,6 +928,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "max_rps": args.max_rps,
         "retries": args.retries,
         "backoff": args.backoff,
+        "discovery_retries": args.discovery_retries,
+        "discovery_retry_pause": args.discovery_retry_pause,
+        "discovery_failed": bool(discovery_failed),
         "csv_zip_skipped": bool(args.skip_csv_zip),
         "expected": {"total_elements": total_elements, "total_pages": total_pages, "first_page": 0, "last_page": total_pages - 1},
         "page_fetch_audit": page_fetch_audit,
