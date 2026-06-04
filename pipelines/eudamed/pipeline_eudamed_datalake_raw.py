@@ -58,7 +58,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_FILE = SCRIPT_DIR / "config" / "eudamed_filters.json"
 
 PIPELINE_NAME = "eudamed_datalake_raw"
-PIPELINE_VERSION = "2.1.0-datalake-raw-stable-merge"
+PIPELINE_VERSION = "2.1.1-datalake-raw-stable-merge-preserve-duplicates"
 
 RAW_LATEST_DB = "eudamed_datalake_raw_latest.duckdb"
 TRACE_LATEST_DB = "eudamed_trace_latest.duckdb"
@@ -1015,6 +1015,15 @@ def merge_one_table(
     table: str,
     run_status: str,
 ) -> dict[str, Any]:
+    """Merge staging into latest while preserving physical raw rows.
+
+    Important raw principle:
+    - Merge keys are used for coverage only.
+    - Staging rows are never deduplicated.
+    - If EUDAMED returns two identical rows, raw latest keeps both rows.
+    - On PARTIAL runs, previous rows are retained only for keys not seen in staging.
+    - On COMPLETE runs, staging is the full source snapshot and replaces previous state.
+    """
     keys = MERGE_KEYS[table]
 
     con_out.execute(f"ATTACH '{staging_db_path}' AS staging")
@@ -1025,12 +1034,15 @@ def merge_one_table(
             "table": table,
             "run_status": run_status,
             "stage_rows": 0,
+            "stage_distinct_keys": 0,
+            "stage_duplicate_physical_rows": 0,
             "total_rows": 0,
             "refreshed_rows": 0,
             "stale_rows": 0,
             "retained_rows": 0,
             "merge_key": keys,
             "complete_replace": False,
+            "physical_rows_preserved": True,
         }
 
     previous_attached = False
@@ -1059,25 +1071,23 @@ def merge_one_table(
             has_prev = False
 
     stage_select = select_aligned("s", cols, stage_cols)
+    stage_rows = table_count(con_out, f"staging.{q(table)}")
+    stage_distinct_keys = int(
+        con_out.execute(
+            f"SELECT COUNT(*) FROM (SELECT DISTINCT {key_expr('s', keys)} AS k FROM staging.{q(table)} s)"
+        ).fetchone()[0]
+    )
+    stage_duplicate_physical_rows = max(stage_rows - stage_distinct_keys, 0)
 
-    # Deduplicate current staging by merge key. The latest extracted row wins.
+    # Keep the exact physical rows returned by EUDAMED for this run.
+    # No DISTINCT/ROW_NUMBER here: raw must preserve duplicate rows if the source sends them.
     con_out.execute(
         f"""
-        CREATE TEMP TABLE {q(table + '_stage_dedup')} AS
+        CREATE TEMP TABLE {q(table + '_stage_raw')} AS
         SELECT {stage_select}
-        FROM (
-            SELECT *,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY {key_expr('s0', keys)}
-                       ORDER BY COALESCE(EXTRACT_DATETIME_UTC, '') DESC
-                   ) AS rn
-            FROM staging.{q(table)} s0
-        ) s
-        WHERE rn = 1
+        FROM staging.{q(table)} s
         """
     )
-
-    stage_rows = table_count(con_out, table + "_stage_dedup")
 
     complete_replace = run_status == "COMPLETE"
 
@@ -1086,44 +1096,60 @@ def merge_one_table(
             f"""
             CREATE TABLE {q(table)} AS
             SELECT {", ".join(q(c) for c in cols)}
-            FROM {q(table + '_stage_dedup')}
+            FROM {q(table + '_stage_raw')}
             """
         )
+        retained_rows = 0
     else:
         prev_select = select_aligned("p", cols, prev_cols)
         con_out.execute(
             f"""
-            CREATE TEMP TABLE {q(table + '_prev_dedup')} AS
+            CREATE TEMP TABLE {q(table + '_prev_raw')} AS
             SELECT {prev_select}
-            FROM (
-                SELECT *,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY {key_expr('p0', keys)}
-                           ORDER BY COALESCE(EXTRACT_DATETIME_UTC, '') DESC
-                       ) AS rn
-                FROM previous.{q(table)} p0
-            ) p
-            WHERE rn = 1
+            FROM previous.{q(table)} p
             """
         )
 
         skey = key_expr("s", keys)
         pkey = key_expr("p", keys)
 
+        # Partial run:
+        # - For keys seen in staging, replace previous rows with all staging rows.
+        # - For keys not seen in staging, retain all previous physical rows.
+        # This avoids false deletions while preserving source duplicates.
         con_out.execute(
             f"""
             CREATE TABLE {q(table)} AS
             SELECT {", ".join(q(c) for c in cols)}
-            FROM {q(table + '_stage_dedup')}
+            FROM {q(table + '_stage_raw')}
             UNION ALL
             SELECT {", ".join(f"p.{q(c)}" for c in cols)}
-            FROM {q(table + '_prev_dedup')} p
+            FROM {q(table + '_prev_raw')} p
             WHERE NOT EXISTS (
                 SELECT 1
-                FROM {q(table + '_stage_dedup')} s
-                WHERE {skey} = {pkey}
+                FROM (
+                    SELECT DISTINCT {skey} AS stage_key
+                    FROM {q(table + '_stage_raw')} s
+                ) seen
+                WHERE seen.stage_key = {pkey}
             )
             """
+        )
+        retained_rows = int(
+            con_out.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {q(table + '_prev_raw')} p
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM (
+                        SELECT DISTINCT {skey} AS stage_key
+                        FROM {q(table + '_stage_raw')} s
+                    ) seen
+                    WHERE seen.stage_key = {pkey}
+                )
+                """
+            ).fetchone()[0]
         )
 
     total_rows = table_count(con_out, table)
@@ -1134,7 +1160,6 @@ def merge_one_table(
         ).fetchone()[0]
     )
     stale_rows = total_rows - refreshed_rows
-    retained_rows = max(total_rows - stage_rows, 0)
 
     if previous_attached:
         con_out.execute("DETACH previous")
@@ -1144,12 +1169,15 @@ def merge_one_table(
         "table": table,
         "run_status": run_status,
         "stage_rows": stage_rows,
+        "stage_distinct_keys": stage_distinct_keys,
+        "stage_duplicate_physical_rows": stage_duplicate_physical_rows,
         "total_rows": total_rows,
         "refreshed_rows": refreshed_rows,
         "stale_rows": stale_rows,
         "retained_rows": retained_rows,
         "merge_key": keys,
         "complete_replace": complete_replace,
+        "physical_rows_preserved": True,
     }
 
 
