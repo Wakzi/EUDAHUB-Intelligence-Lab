@@ -49,7 +49,7 @@ import pandas as pd
 import requests
 
 
-PIPELINE_VERSION = "v4.7.1"
+PIPELINE_VERSION = "v4.7.2"
 BASE_URL_DEFAULT = "https://ec.europa.eu/tools/eudamed/api"
 UDI_ENDPOINT = "/devices/udiDiData"
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -199,6 +199,11 @@ class EudamedClient:
         self.backoff = backoff
         self.max_rps = max_rps
         self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": f"EUDAHUB-Intelligence Platform Raw {PIPELINE_VERSION}",
+            "Accept": "application/json,text/plain,*/*",
+            "Cache-Control": "no-cache",
+        })
         self._last_request_at = 0.0
 
     def _rate_limit(self) -> None:
@@ -215,9 +220,7 @@ class EudamedClient:
         url = f"{self.base_url}{UDI_ENDPOINT}"
         params = {
             "page": page,
-            "pageSize": self.page_size,
             "size": self.page_size,
-            "iso2Code": self.language,
             "languageIso2Code": self.language,
         }
         last_error = None
@@ -228,15 +231,37 @@ class EudamedClient:
                 resp = self.session.get(url, params=params, timeout=self.timeout)
                 elapsed_ms = (time.monotonic() - start) * 1000
                 retry_after = resp.headers.get("Retry-After")
+                text = resp.text or ""
+
+                if page == 0 and attempt == 0:
+                    log(f"INITIAL REQUEST URL: {resp.request.url}")
+                    log(f"INITIAL REQUEST HEADERS: {dict(resp.request.headers)}")
+
                 if resp.status_code == 200:
                     return page, resp.status_code, resp.json(), None, elapsed_ms, retry_after
-                if resp.status_code in {429, 500, 502, 503, 504} and attempt < self.retries:
-                    sleep_s = float(retry_after) if retry_after and retry_after.isdigit() else self.backoff * (attempt + 1)
+
+                if "Web Filter" in text or "Access Denied" in text or "security reason" in text:
+                    return page, resp.status_code, None, f"WEB_FILTER_ACCESS_DENIED: HTTP {resp.status_code}: {text[:500]}", elapsed_ms, retry_after
+
+                if resp.status_code == 429 and attempt < self.retries:
+                    if retry_after and retry_after.isdigit():
+                        sleep_s = float(retry_after)
+                    else:
+                        sleep_s = min(300.0, 30.0 * (attempt + 1))
+                    sleep_s += random.random() * 0.5
+                    last_error = f"HTTP 429; retry_after={retry_after}; sleep={sleep_s:.1f}s"
+                    log(f"WARNING {last_error}")
+                    time.sleep(sleep_s)
+                    continue
+
+                if resp.status_code in {500, 502, 503, 504} and attempt < self.retries:
+                    sleep_s = min(120.0, self.backoff * (attempt + 1))
                     sleep_s += random.random() * 0.25
                     last_error = f"HTTP {resp.status_code}; retry_after={retry_after}; sleep={sleep_s:.1f}s"
                     time.sleep(sleep_s)
                     continue
-                return page, resp.status_code, None, f"HTTP {resp.status_code}: {resp.text[:500]}", elapsed_ms, retry_after
+
+                return page, resp.status_code, None, f"HTTP {resp.status_code}: {text[:500]}", elapsed_ms, retry_after
             except Exception as e:
                 elapsed_ms = (time.monotonic() - start) * 1000
                 last_error = repr(e)
@@ -246,24 +271,55 @@ class EudamedClient:
                 return page, 0, None, last_error, elapsed_ms, None
         return page, 0, None, last_error or "unknown_error", 0.0, None
 
-    def discover(self) -> Dict[str, Any]:
+    def initial_page_fetch(self) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Dict[str, Any]]:
         page, status, data, error, elapsed, retry_after = self.fetch_page(0)
         content = data.get("content", []) if data else []
-        return {
-            "discovered_at_utc": iso_utc_now(),
+        initial_page = {
+            "fetched_at_utc": iso_utc_now(),
             "requested_page_size": self.page_size,
             "response_page_size": data.get("size") if data else None,
             "total_elements": data.get("totalElements") if data else None,
             "total_pages": data.get("totalPages") if data else None,
-            "first_page_number_of_elements": data.get("numberOfElements") if data else None,
-            "first_page_content_length": len(content),
-            "first_page_status_code": status,
-            "first_page_ok": status == 200,
-            "first_page_first_flag": data.get("first") if data else None,
-            "first_page_last_flag": data.get("last") if data else None,
-            "first_page_number": data.get("number") if data else None,
+            "number_of_elements": data.get("numberOfElements") if data else None,
+            "content_length": len(content),
+            "status_code": status,
+            "ok": status == 200,
+            "first_flag": data.get("first") if data else None,
+            "last_flag": data.get("last") if data else None,
+            "page_number": data.get("number") if data else None,
             "raw_metadata": json.dumps({k: v for k, v in (data or {}).items() if k != "content"}, ensure_ascii=False) if data else None,
-            "first_page_error": error,
+            "error": error,
+        }
+        request_row = {
+            "endpoint": "devices_udiDiData_list",
+            "page": 0,
+            "status_code": status,
+            "elapsed_ms": elapsed,
+            "retry_after": retry_after,
+            "error": error,
+            "requested_at_utc": iso_utc_now(),
+            "probe": False,
+            "initial_page": True,
+        }
+        return initial_page, data, request_row
+
+    def discover(self) -> Dict[str, Any]:
+        initial_page, _data, _request_row = self.initial_page_fetch()
+        return {
+            "discovered_at_utc": initial_page.get("fetched_at_utc"),
+            "requested_page_size": initial_page.get("requested_page_size"),
+            "response_page_size": initial_page.get("response_page_size"),
+            "total_elements": initial_page.get("total_elements"),
+            "total_pages": initial_page.get("total_pages"),
+            "first_page_number_of_elements": initial_page.get("number_of_elements"),
+            "first_page_content_length": initial_page.get("content_length"),
+            "first_page_status_code": initial_page.get("status_code"),
+            "first_page_ok": initial_page.get("ok"),
+            "first_page_first_flag": initial_page.get("first_flag"),
+            "first_page_last_flag": initial_page.get("last_flag"),
+            "first_page_number": initial_page.get("page_number"),
+            "raw_metadata": initial_page.get("raw_metadata"),
+            "first_page_error": initial_page.get("error"),
         }
 
 
@@ -442,9 +498,9 @@ def dedupe_by_uuid(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(seen.values()) + no_uuid
 
 
-def fetch_full(client: EudamedClient, total_pages: int, workers: int, extract_ts: str):
+def fetch_full(client: EudamedClient, total_pages: int, workers: int, extract_ts: str, start_page: int = 0):
     all_rows, page_audit, request_log = [], [], []
-    log(f"=== Full fetch pages 0..{total_pages - 1} ({total_pages} pages) ===")
+    log(f"=== Full fetch pages {start_page}..{total_pages - 1} ({max(0, total_pages - start_page)} pages) ===")
 
     def task(page: int):
         c = EudamedClient(client.base_url, client.language, client.page_size, client.timeout, client.retries, client.backoff, client.max_rps)
@@ -452,7 +508,7 @@ def fetch_full(client: EudamedClient, total_pages: int, workers: int, extract_ts
 
     done = 0
     with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(task, p): p for p in range(total_pages)}
+        futures = {ex.submit(task, p): p for p in range(start_page, total_pages)}
         for fut in cf.as_completed(futures):
             page, status, data, error, elapsed_ms, retry_after = fut.result()
             done += 1
@@ -478,7 +534,7 @@ def fetch_full(client: EudamedClient, total_pages: int, workers: int, extract_ts
     return all_rows, page_audit, request_log
 
 
-def fetch_incremental(client: EudamedClient, existing_rows: List[Dict[str, Any]], known_max_ulid: str, api_total_elements: int, total_pages: int, extract_ts: str, known_pages_to_stop: int, extra_pages_after_match: int, mismatch_probe_head_pages: int, mismatch_probe_tail_pages: int):
+def fetch_incremental(client: EudamedClient, existing_rows: List[Dict[str, Any]], known_max_ulid: str, api_total_elements: int, total_pages: int, extract_ts: str, known_pages_to_stop: int, extra_pages_after_match: int, mismatch_probe_head_pages: int, mismatch_probe_tail_pages: int, prefetched_page0: Optional[Dict[str, Any]] = None, prefetched_request0: Optional[Dict[str, Any]] = None):
     existing_uuid = {r.get("uuid") for r in existing_rows if r.get("uuid")}
     new_rows, page_audit, request_log = [], [], []
     consecutive_known_only, frontier_reached, known_or_mixed_pages_seen = 0, False, 0
@@ -487,7 +543,14 @@ def fetch_incremental(client: EudamedClient, existing_rows: List[Dict[str, Any]]
 
     def process_page(page: int, probe: bool = False):
         nonlocal new_rows
-        _, status, data, error, elapsed_ms, retry_after = client.fetch_page(page)
+        if page == 0 and prefetched_page0 is not None:
+            status = 200
+            data = prefetched_page0
+            error = None
+            elapsed_ms = (prefetched_request0 or {}).get("elapsed_ms")
+            retry_after = (prefetched_request0 or {}).get("retry_after")
+        else:
+            _, status, data, error, elapsed_ms, retry_after = client.fetch_page(page)
         rows = parse_page(data, page, extract_ts) if data else []
         new_candidates = [r for r in rows if (r.get("ulid") or "") > known_max_ulid]
         added = 0
@@ -513,6 +576,7 @@ def fetch_incremental(client: EudamedClient, existing_rows: List[Dict[str, Any]]
             "endpoint": "devices_udiDiData_list", "page": page, "status_code": status,
             "elapsed_ms": elapsed_ms, "retry_after": retry_after, "error": error,
             "requested_at_utc": iso_utc_now(), "probe": probe,
+            "initial_page": bool(page == 0 and prefetched_page0 is not None),
         })
         return len(rows), len(new_candidates), added
 
@@ -778,19 +842,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"Using max_ulid from DB: {known_max} ({decode_ulid(known_max)})")
 
     client = EudamedClient(args.base_url, args.language, args.page_size, args.timeout, args.retries, args.backoff, args.max_rps)
-    discovery = None
-    for attempt in range(1, args.discovery_retries + 1):
-        discovery = client.discover()
-        log(f"=== Discovery attempt {attempt}/{args.discovery_retries} ===")
-        log(json.dumps(discovery, ensure_ascii=False))
-        if discovery.get("first_page_ok"):
-            break
-        if attempt < args.discovery_retries:
-            sleep_s = args.discovery_retry_pause * attempt
-            log(f"WARNING discovery failed; retrying in {sleep_s:.0f}s")
-            time.sleep(sleep_s)
 
-    discovery_failed = not (discovery and discovery.get("first_page_ok"))
+    log("=== Initial page fetch page=0 ===")
+    initial_page, initial_page_data, initial_request_row = client.initial_page_fetch()
+    log(json.dumps(initial_page, ensure_ascii=False))
+
+    discovery = {
+        "discovered_at_utc": initial_page.get("fetched_at_utc"),
+        "requested_page_size": initial_page.get("requested_page_size"),
+        "response_page_size": initial_page.get("response_page_size"),
+        "total_elements": initial_page.get("total_elements"),
+        "total_pages": initial_page.get("total_pages"),
+        "first_page_number_of_elements": initial_page.get("number_of_elements"),
+        "first_page_content_length": initial_page.get("content_length"),
+        "first_page_status_code": initial_page.get("status_code"),
+        "first_page_ok": initial_page.get("ok"),
+        "first_page_first_flag": initial_page.get("first_flag"),
+        "first_page_last_flag": initial_page.get("last_flag"),
+        "first_page_number": initial_page.get("page_number"),
+        "raw_metadata": initial_page.get("raw_metadata"),
+        "first_page_error": initial_page.get("error"),
+    }
+
+    discovery_failed = not bool(initial_page.get("ok"))
     if discovery_failed:
         log("WARNING discovery failed after retries")
         if not existing_rows:
@@ -835,7 +909,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "discovery_failed": True,
         }
     else:
-        log("=== Discovery complete ===")
+        log("=== Initial page fetch complete ===")
         total_elements = int(discovery.get("total_elements") or 0)
         total_pages = int(discovery.get("total_pages") or 0)
         if args.max_pages and args.max_pages > 0:
@@ -845,14 +919,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             log("WARNING no max_ulid found; fallback to full mode")
             args.mode = "full"
 
+        initial_rows = parse_page(initial_page_data, 0, extract_ts) if initial_page_data else []
+        initial_page_audit = [{
+            "page": 0,
+            "status_code": initial_page.get("status_code"),
+            "ok": bool(initial_page.get("ok")),
+            "rows_returned": len(initial_rows),
+            "api_number": initial_page.get("page_number"),
+            "api_first": initial_page.get("first_flag"),
+            "api_last": initial_page.get("last_flag"),
+            "api_total_elements": initial_page.get("total_elements"),
+            "api_total_pages": initial_page.get("total_pages"),
+            "elapsed_ms": initial_request_row.get("elapsed_ms"),
+            "error": initial_page.get("error"),
+            "initial_page": True,
+        }]
+
         if args.mode == "full":
-            rows, page_audit, request_log = fetch_full(client, total_pages, args.workers, extract_ts)
+            rest_rows, rest_page_audit, rest_request_log = fetch_full(client, total_pages, args.workers, extract_ts, start_page=1)
+            rows = initial_rows + rest_rows
+            page_audit = initial_page_audit + rest_page_audit
+            request_log = [initial_request_row] + rest_request_log
             incremental_audit = None
         else:
             rows, page_audit, request_log, incremental_audit = fetch_incremental(
                 client, existing_rows, known_max, total_elements, total_pages, extract_ts,
                 args.known_pages_to_stop, args.extra_pages_after_match,
                 args.mismatch_probe_head_pages, args.mismatch_probe_tail_pages,
+                prefetched_page0=initial_page_data,
+                prefetched_request0=initial_request_row,
             )
 
     rows = dedupe_by_uuid(rows)
@@ -931,6 +1026,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "discovery_retries": args.discovery_retries,
         "discovery_retry_pause": args.discovery_retry_pause,
         "discovery_failed": bool(discovery_failed),
+        "initial_page_fetch_used_as_data": True,
         "csv_zip_skipped": bool(args.skip_csv_zip),
         "expected": {"total_elements": total_elements, "total_pages": total_pages, "first_page": 0, "last_page": total_pages - 1},
         "page_fetch_audit": page_fetch_audit,
