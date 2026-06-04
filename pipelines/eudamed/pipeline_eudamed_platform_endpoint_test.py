@@ -39,17 +39,17 @@ ENDPOINTS = [
     {
         "name": "udi",
         "description": "UDI/Devices list endpoint",
-        "url": "https://ec.europa.eu/tools/eudamed/api/devices/udiDiData?page=0&size=1&languageIso2Code=en",
+        "url": "https://ec.europa.eu/tools/eudamed/api/devices/udiDiData?page=0&size=300&languageIso2Code=en",
     },
     {
         "name": "eos",
         "description": "Actors/Economic operators endpoint",
-        "url": "https://ec.europa.eu/tools/eudamed/api/eos?page=0&size=1&languageIso2Code=en",
+        "url": "https://ec.europa.eu/tools/eudamed/api/eos?page=0&size=300&languageIso2Code=en",
     },
     {
         "name": "ses",
         "description": "SES/NB endpoint",
-        "url": "https://ec.europa.eu/tools/eudamed/api/ses?page=0&size=1&languageIso2Code=en",
+        "url": "https://ec.europa.eu/tools/eudamed/api/ses?page=0&size=300&languageIso2Code=en",
     },
 ]
 
