@@ -3,35 +3,47 @@
 """
 EUDAMED Platform Raw acquisition pipeline.
 
-Pipeline version: v4.7
+Pipeline version: v4.8.0
 
-Scope:
+Scope
+-----
 - Raw acquisition only.
-- Current domain implemented: UDI.
-- Future domain planned: Actors.
+- Current domain implemented: UDI list endpoint.
 - No CDC, no canonical merge, no DK subset.
 
-Important:
-- Repo path expected by workflow:
-  pipelines/eudamed/pipeline_eudamed_platform_raw.py
+Design
+------
+- Default mode is incremental.
+- Manual mode can be incremental or full.
+- page=0 is the initial data page and also contains all metadata needed
+  (totalElements, totalPages, page size, first/last flags).
+- Previous latest is optional. If incremental is requested and no previous DB
+  exists, the run becomes BOOTSTRAP and performs a full crawl.
+- COMPLETE, PARTIAL, BOOTSTRAP publish a merged latest.
+- FAILED means zero usable rows were received and latest should not be updated.
+- Partial runs never delete or shrink latest: they merge received rows into the
+  previous latest by UUID and retain unseen previous rows.
 
-Release naming:
-- Latest release: eudamed-platform-raw-latest
-- Latest assets:
-  eudamed_platform_raw.duckdb
-  eudamed_platform_raw.csv.zip
-  eudamed_platform_raw_state.json
-  eudamed_platform_raw_stats.json
-  release_notes.md
+Release naming
+--------------
+Latest tag: eudamed-platform-raw-latest
+Latest assets:
+  eudamed_platform_raw_latest.duckdb
+  eudamed_platform_raw_latest_csv.zip
+  eudamed_platform_raw_latest.metadata.json
+  RELEASE_NOTES_EUDAMED_PLATFORM_RAW.md
 
-Backward compatibility:
-- First run after rename can bootstrap from legacy eudamed-ui-lab-latest assets/state.
+Dated tag: eudamed-platform-raw-YYYYMMDD_HHMMSS
+Dated assets:
+  eudamed_platform_raw_YYYYMMDD_HHMMSS.duckdb
+  eudamed_platform_raw_YYYYMMDD_HHMMSS_csv.zip
+  eudamed_platform_raw_YYYYMMDD_HHMMSS.metadata.json
+  RELEASE_NOTES_EUDAMED_PLATFORM_RAW_YYYYMMDD_HHMMSS.md
 """
 
 from __future__ import annotations
 
 import argparse
-import concurrent.futures as cf
 import csv
 import datetime as dt
 import json
@@ -48,11 +60,15 @@ import duckdb
 import pandas as pd
 import requests
 
-
-PIPELINE_VERSION = "v4.7.2"
+PIPELINE_VERSION = "v4.8.0"
 BASE_URL_DEFAULT = "https://ec.europa.eu/tools/eudamed/api"
 UDI_ENDPOINT = "/devices/udiDiData"
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+RUN_BOOTSTRAP = "BOOTSTRAP"
+RUN_COMPLETE = "COMPLETE"
+RUN_PARTIAL = "PARTIAL"
+RUN_FAILED = "FAILED"
 
 
 def utc_now() -> dt.datetime:
@@ -60,7 +76,7 @@ def utc_now() -> dt.datetime:
 
 
 def iso_utc_now() -> str:
-    return utc_now().isoformat()
+    return utc_now().replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def log(msg: str) -> None:
@@ -96,6 +112,15 @@ def release_timestamp(value: Optional[str]) -> str:
     return utc_now().strftime("%Y%m%d_%H%M%S")
 
 
+def release_title_time(ts: str) -> str:
+    # YYYYMMDD_HHMMSS -> YYYY-MM-DD HH:MM:SS UTC
+    try:
+        d = dt.datetime.strptime(ts, "%Y%m%d_%H%M%S")
+        return d.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except Exception:
+        return utc_now().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def ulid_timestamp_ms(ulid: Optional[str]) -> Optional[int]:
     if not ulid:
         return None
@@ -119,12 +144,12 @@ def decode_ulid(ulid: Optional[str]) -> Optional[str]:
 
 
 def min_ulid(values: Iterable[Optional[str]]) -> Optional[str]:
-    vals = [v for v in values if v]
+    vals = [str(v) for v in values if v]
     return min(vals) if vals else None
 
 
 def max_ulid(values: Iterable[Optional[str]]) -> Optional[str]:
-    vals = [v for v in values if v]
+    vals = [str(v) for v in values if v]
     return max(vals) if vals else None
 
 
@@ -142,8 +167,10 @@ def jdump(obj: Any) -> Optional[str]:
     return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
 
 
-def flatten_udi(row: Dict[str, Any], page_number: int, extract_ts: str) -> Dict[str, Any]:
+def flatten_udi(row: Dict[str, Any], page_number: int, extract_date: str, extract_ts: str) -> Dict[str, Any]:
     return {
+        "EXTRACT_DATE": extract_date,
+        "EXTRACT_DATETIME_UTC": extract_ts,
         "basic_udi": row.get("basicUdi"),
         "primary_di": row.get("primaryDi"),
         "uuid": row.get("uuid"),
@@ -182,11 +209,10 @@ def flatten_udi(row: Dict[str, Any], page_number: int, extract_ts: str) -> Dict[
         "raw_json": jdump(row),
         "source_endpoint": "devices/udiDiData",
         "source_page": page_number,
-        "extract_timestamp_utc": extract_ts,
     }
 
 
-UDI_COLUMNS = list(flatten_udi({}, 0, "").keys())
+UDI_COLUMNS = list(flatten_udi({}, 0, "", "").keys())
 
 
 class EudamedClient:
@@ -218,11 +244,7 @@ class EudamedClient:
 
     def fetch_page(self, page: int) -> Tuple[int, int, Optional[Dict[str, Any]], Optional[str], float, Optional[str]]:
         url = f"{self.base_url}{UDI_ENDPOINT}"
-        params = {
-            "page": page,
-            "size": self.page_size,
-            "languageIso2Code": self.language,
-        }
+        params = {"page": page, "size": self.page_size, "languageIso2Code": self.language}
         last_error = None
         for attempt in range(self.retries + 1):
             self._rate_limit()
@@ -232,17 +254,13 @@ class EudamedClient:
                 elapsed_ms = (time.monotonic() - start) * 1000
                 retry_after = resp.headers.get("Retry-After")
                 text = resp.text or ""
-
                 if page == 0 and attempt == 0:
                     log(f"INITIAL REQUEST URL: {resp.request.url}")
                     log(f"INITIAL REQUEST HEADERS: {dict(resp.request.headers)}")
-
                 if resp.status_code == 200:
                     return page, resp.status_code, resp.json(), None, elapsed_ms, retry_after
-
                 if "Web Filter" in text or "Access Denied" in text or "security reason" in text:
                     return page, resp.status_code, None, f"WEB_FILTER_ACCESS_DENIED: HTTP {resp.status_code}: {text[:500]}", elapsed_ms, retry_after
-
                 if resp.status_code == 429 and attempt < self.retries:
                     if retry_after and retry_after.isdigit():
                         sleep_s = float(retry_after)
@@ -253,14 +271,12 @@ class EudamedClient:
                     log(f"WARNING {last_error}")
                     time.sleep(sleep_s)
                     continue
-
                 if resp.status_code in {500, 502, 503, 504} and attempt < self.retries:
-                    sleep_s = min(120.0, self.backoff * (attempt + 1))
-                    sleep_s += random.random() * 0.25
+                    sleep_s = min(120.0, self.backoff * (attempt + 1)) + random.random() * 0.25
                     last_error = f"HTTP {resp.status_code}; retry_after={retry_after}; sleep={sleep_s:.1f}s"
+                    log(f"WARNING {last_error}")
                     time.sleep(sleep_s)
                     continue
-
                 return page, resp.status_code, None, f"HTTP {resp.status_code}: {text[:500]}", elapsed_ms, retry_after
             except Exception as e:
                 elapsed_ms = (time.monotonic() - start) * 1000
@@ -271,56 +287,35 @@ class EudamedClient:
                 return page, 0, None, last_error, elapsed_ms, None
         return page, 0, None, last_error or "unknown_error", 0.0, None
 
-    def initial_page_fetch(self) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Dict[str, Any]]:
-        page, status, data, error, elapsed, retry_after = self.fetch_page(0)
-        content = data.get("content", []) if data else []
-        initial_page = {
-            "fetched_at_utc": iso_utc_now(),
-            "requested_page_size": self.page_size,
-            "response_page_size": data.get("size") if data else None,
-            "total_elements": data.get("totalElements") if data else None,
-            "total_pages": data.get("totalPages") if data else None,
-            "number_of_elements": data.get("numberOfElements") if data else None,
-            "content_length": len(content),
-            "status_code": status,
-            "ok": status == 200,
-            "first_flag": data.get("first") if data else None,
-            "last_flag": data.get("last") if data else None,
-            "page_number": data.get("number") if data else None,
-            "raw_metadata": json.dumps({k: v for k, v in (data or {}).items() if k != "content"}, ensure_ascii=False) if data else None,
-            "error": error,
-        }
-        request_row = {
-            "endpoint": "devices_udiDiData_list",
-            "page": 0,
-            "status_code": status,
-            "elapsed_ms": elapsed,
-            "retry_after": retry_after,
-            "error": error,
-            "requested_at_utc": iso_utc_now(),
-            "probe": False,
-            "initial_page": True,
-        }
-        return initial_page, data, request_row
 
-    def discover(self) -> Dict[str, Any]:
-        initial_page, _data, _request_row = self.initial_page_fetch()
-        return {
-            "discovered_at_utc": initial_page.get("fetched_at_utc"),
-            "requested_page_size": initial_page.get("requested_page_size"),
-            "response_page_size": initial_page.get("response_page_size"),
-            "total_elements": initial_page.get("total_elements"),
-            "total_pages": initial_page.get("total_pages"),
-            "first_page_number_of_elements": initial_page.get("number_of_elements"),
-            "first_page_content_length": initial_page.get("content_length"),
-            "first_page_status_code": initial_page.get("status_code"),
-            "first_page_ok": initial_page.get("ok"),
-            "first_page_first_flag": initial_page.get("first_flag"),
-            "first_page_last_flag": initial_page.get("last_flag"),
-            "first_page_number": initial_page.get("page_number"),
-            "raw_metadata": initial_page.get("raw_metadata"),
-            "first_page_error": initial_page.get("error"),
-        }
+def table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
+    return con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?", [table]).fetchone()[0] > 0
+
+
+def existing_udi_table(con: duckdb.DuckDBPyConnection) -> Optional[str]:
+    for t in ["udi", "ui_devices_list_all"]:
+        if table_exists(con, t):
+            return t
+    return None
+
+
+def find_existing_db(inputs_dir: Path) -> Optional[Path]:
+    candidates = [
+        inputs_dir / "eudamed_platform_raw_latest.duckdb",
+        inputs_dir / "eudamed_platform_raw.duckdb",
+        inputs_dir / "eudamed_platform_raw_latest.duckdb.zip",
+        inputs_dir / "eudamed_platform_raw.duckdb.zip",
+    ]
+    for p in candidates:
+        if p.exists() and p.suffix == ".duckdb":
+            return p
+        if p.exists() and p.suffix == ".zip":
+            extracted = unzip_duckdb(p, inputs_dir)
+            if extracted:
+                return extracted
+    for p in sorted(inputs_dir.glob("*.duckdb")):
+        return p
+    return None
 
 
 def unzip_duckdb(zip_path: Path, out_dir: Path) -> Optional[Path]:
@@ -341,91 +336,6 @@ def unzip_duckdb(zip_path: Path, out_dir: Path) -> Optional[Path]:
         return None
 
 
-def find_existing_db(inputs_dir: Path) -> Optional[Path]:
-    candidates = [
-        inputs_dir / "eudamed_platform_raw.duckdb",
-        inputs_dir / "eudamed_platform_raw.duckdb.zip",
-        inputs_dir / "eudamed_ui_lab.duckdb",
-        inputs_dir / "eudamed_ui_lab.duckdb.zip",
-        inputs_dir / "eudamed_ui_lab_v4_6.duckdb",
-        inputs_dir / "eudamed_ui_lab_v4_6.duckdb.zip",
-        inputs_dir / "eudamed_ui_lab_v4_5.duckdb",
-        inputs_dir / "eudamed_ui_lab_v4_5.duckdb.zip",
-        inputs_dir / "eudamed_ui_lab_v4_4.duckdb",
-        inputs_dir / "eudamed_ui_lab_v4_4.duckdb.zip",
-    ]
-    for p in candidates:
-        if p.exists() and p.suffix == ".duckdb":
-            return p
-        if p.exists() and p.suffix == ".zip":
-            extracted = unzip_duckdb(p, inputs_dir)
-            if extracted and extracted.exists():
-                return extracted
-    for p in sorted(inputs_dir.glob("*.duckdb")):
-        return p
-    for p in sorted(inputs_dir.glob("*.duckdb.zip")):
-        extracted = unzip_duckdb(p, inputs_dir)
-        if extracted:
-            return extracted
-    return None
-
-
-def read_state_file(inputs_dir: Path) -> Optional[Dict[str, Any]]:
-    candidates = [
-        inputs_dir / "eudamed_platform_raw_state.json",
-        inputs_dir / "ui_api_state_v4_6.json",
-        inputs_dir / "ui_api_state_v4_5.json",
-        inputs_dir / "ui_api_state_v4_4.json",
-        inputs_dir / "ui_api_state.json",
-    ]
-    for p in candidates:
-        if p.exists():
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-                if data.get("max_ulid"):
-                    log(f"State bootstrap found: {p}")
-                    return data
-            except Exception as e:
-                log(f"WARNING could not read state {p}: {e}")
-    return None
-
-
-def table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
-    return con.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?", [table]).fetchone()[0] > 0
-
-
-def existing_udi_table(con: duckdb.DuckDBPyConnection) -> Optional[str]:
-    for t in ["udi", "ui_devices_list_all"]:
-        if table_exists(con, t):
-            return t
-    return None
-
-
-def bootstrap_from_db(db_path: Path) -> Dict[str, Any]:
-    con = duckdb.connect(str(db_path), read_only=True)
-    try:
-        table = existing_udi_table(con)
-        if not table:
-            return {}
-        cols = {r[1].lower(): r[1] for r in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
-        ulid_col = cols.get("ulid") or cols.get("udi_di_data_ulid")
-        if not ulid_col:
-            return {}
-        n, min_u, max_u = con.execute(f"SELECT COUNT(*), MIN({ulid_col}), MAX({ulid_col}) FROM {table} WHERE {ulid_col} IS NOT NULL").fetchone()
-        return {
-            "source": "db",
-            "db_path": str(db_path),
-            "table": table,
-            "row_count": int(n or 0),
-            "min_ulid": min_u,
-            "min_ulid_timestamp": decode_ulid(min_u),
-            "max_ulid": max_u,
-            "max_ulid_timestamp": decode_ulid(max_u),
-        }
-    finally:
-        con.close()
-
-
 def read_existing_rows(db_path: Path) -> List[Dict[str, Any]]:
     con = duckdb.connect(str(db_path), read_only=True)
     try:
@@ -435,21 +345,17 @@ def read_existing_rows(db_path: Path) -> List[Dict[str, Any]]:
         df = con.execute(f"SELECT * FROM {table}").fetchdf()
         records = df.to_dict("records")
         out: List[Dict[str, Any]] = []
-        if table == "udi":
-            for r in records:
-                d = {c: r.get(c) for c in UDI_COLUMNS}
-                out.append(d)
-            return out
-
         mapping = {
             "basic_udi": ["basicUdi", "basic_udi"],
             "primary_di": ["primaryDi", "primary_di"],
             "uuid": ["uuid"],
             "ulid": ["ulid"],
             "basic_udi_di_data_ulid": ["basicUdiDiDataUlid", "basic_udi_di_data_ulid"],
+            "risk_class_code": ["risk_class_code"],
             "trade_name": ["tradeName", "trade_name"],
             "manufacturer_name": ["manufacturerName", "manufacturer_name"],
             "manufacturer_srn": ["manufacturerSrn", "manufacturer_srn"],
+            "device_status_code": ["device_status_code"],
             "latest_version": ["latestVersion", "latest_version"],
             "version_number": ["versionNumber", "version_number"],
             "device_name": ["deviceName", "device_name"],
@@ -470,6 +376,9 @@ def read_existing_rows(db_path: Path) -> List[Dict[str, Any]]:
                         if old_key in r:
                             d[new_key] = r.get(old_key)
                             break
+            # Old UI Lab did not have these two columns; retain old records with their old extract value if available.
+            d["EXTRACT_DATE"] = d.get("EXTRACT_DATE") or str(r.get("EXTRACT_DATE") or r.get("extract_date") or "") or None
+            d["EXTRACT_DATETIME_UTC"] = d.get("EXTRACT_DATETIME_UTC") or str(r.get("EXTRACT_DATETIME_UTC") or r.get("extract_timestamp_utc") or r.get("extract_datetime_utc") or "") or None
             d["ulid_timestamp"] = d.get("ulid_timestamp") or decode_ulid(d.get("ulid"))
             d["basic_udi_di_data_ulid_timestamp"] = d.get("basic_udi_di_data_ulid_timestamp") or decode_ulid(d.get("basic_udi_di_data_ulid"))
             d["basic_udi_data_ulid_timestamp"] = d.get("basic_udi_data_ulid_timestamp") or decode_ulid(d.get("basic_udi_data_ulid"))
@@ -480,111 +389,140 @@ def read_existing_rows(db_path: Path) -> List[Dict[str, Any]]:
         con.close()
 
 
-def parse_page(data: Dict[str, Any], page: int, extract_ts: str) -> List[Dict[str, Any]]:
-    return [flatten_udi(item, page, extract_ts) for item in data.get("content", [])]
+def parse_page(data: Dict[str, Any], page: int, extract_date: str, extract_ts: str) -> List[Dict[str, Any]]:
+    return [flatten_udi(item, page, extract_date, extract_ts) for item in data.get("content", [])]
 
 
-def dedupe_by_uuid(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def dedupe_by_uuid_choose_latest(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen: Dict[str, Dict[str, Any]] = {}
-    no_uuid = []
+    no_uuid: List[Dict[str, Any]] = []
     for r in rows:
         u = r.get("uuid")
         if not u:
             no_uuid.append(r)
             continue
         old = seen.get(u)
-        if old is None or (r.get("ulid") or "") > (old.get("ulid") or ""):
+        if old is None:
+            seen[u] = r
+            continue
+        # Prefer newer ULID. If ULID is equal/missing, prefer row with newer extract datetime.
+        r_key = (str(r.get("ulid") or ""), str(r.get("EXTRACT_DATETIME_UTC") or ""))
+        old_key = (str(old.get("ulid") or ""), str(old.get("EXTRACT_DATETIME_UTC") or ""))
+        if r_key >= old_key:
             seen[u] = r
     return list(seen.values()) + no_uuid
 
 
-def fetch_full(client: EudamedClient, total_pages: int, workers: int, extract_ts: str, start_page: int = 0):
-    all_rows, page_audit, request_log = [], [], []
-    log(f"=== Full fetch pages {start_page}..{total_pages - 1} ({max(0, total_pages - start_page)} pages) ===")
-
-    def task(page: int):
-        c = EudamedClient(client.base_url, client.language, client.page_size, client.timeout, client.retries, client.backoff, client.max_rps)
-        return c.fetch_page(page)
-
-    done = 0
-    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(task, p): p for p in range(start_page, total_pages)}
-        for fut in cf.as_completed(futures):
-            page, status, data, error, elapsed_ms, retry_after = fut.result()
-            done += 1
-            rows = parse_page(data, page, extract_ts) if data else []
-            all_rows.extend(rows)
-            page_audit.append({
-                "page": page, "status_code": status, "ok": status == 200,
-                "rows_returned": len(rows), "api_number": data.get("number") if data else None,
-                "api_first": data.get("first") if data else None, "api_last": data.get("last") if data else None,
-                "api_total_elements": data.get("totalElements") if data else None,
-                "api_total_pages": data.get("totalPages") if data else None,
-                "elapsed_ms": elapsed_ms, "error": error,
-            })
-            request_log.append({
-                "endpoint": "devices_udiDiData_list", "page": page, "status_code": status,
-                "elapsed_ms": elapsed_ms, "retry_after": retry_after, "error": error,
-                "requested_at_utc": iso_utc_now(), "probe": False,
-            })
-            if done % 50 == 0 or done == total_pages:
-                log(f"Pages completed {done}/{total_pages} | rows={len(all_rows):,}")
-    page_audit.sort(key=lambda r: r["page"])
-    request_log.sort(key=lambda r: r["page"])
-    return all_rows, page_audit, request_log
+def merge_rows(previous_rows: List[Dict[str, Any]], received_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    prev_by_uuid = {r.get("uuid"): r for r in previous_rows if r.get("uuid")}
+    recv_by_uuid = {r.get("uuid"): r for r in received_rows if r.get("uuid")}
+    previous_uuid_set = set(prev_by_uuid)
+    received_uuid_set = set(recv_by_uuid)
+    inserted = len(received_uuid_set - previous_uuid_set)
+    refreshed = len(received_uuid_set & previous_uuid_set)
+    retained = len(previous_uuid_set - received_uuid_set)
+    merged = dedupe_by_uuid_choose_latest(previous_rows + received_rows)
+    stats = {
+        "previous_rows": len(previous_rows),
+        "received_rows": len(received_rows),
+        "previous_uuid_count": len(previous_uuid_set),
+        "received_uuid_count": len(received_uuid_set),
+        "inserted_uuid_count": inserted,
+        "refreshed_uuid_count": refreshed,
+        "retained_uuid_count": retained,
+        "merged_rows": len(merged),
+    }
+    return merged, stats
 
 
-def fetch_incremental(client: EudamedClient, existing_rows: List[Dict[str, Any]], known_max_ulid: str, api_total_elements: int, total_pages: int, extract_ts: str, known_pages_to_stop: int, extra_pages_after_match: int, mismatch_probe_head_pages: int, mismatch_probe_tail_pages: int, prefetched_page0: Optional[Dict[str, Any]] = None, prefetched_request0: Optional[Dict[str, Any]] = None):
-    existing_uuid = {r.get("uuid") for r in existing_rows if r.get("uuid")}
-    new_rows, page_audit, request_log = [], [], []
-    consecutive_known_only, frontier_reached, known_or_mixed_pages_seen = 0, False, 0
+def initial_page_record(data: Optional[Dict[str, Any]], status: int, error: Optional[str], elapsed_ms: float, retry_after: Optional[str], page_size: int) -> Dict[str, Any]:
+    content = data.get("content", []) if data else []
+    return {
+        "fetched_at_utc": iso_utc_now(),
+        "requested_page_size": page_size,
+        "response_page_size": data.get("size") if data else None,
+        "total_elements": data.get("totalElements") if data else None,
+        "total_pages": data.get("totalPages") if data else None,
+        "number_of_elements": data.get("numberOfElements") if data else None,
+        "content_length": len(content),
+        "status_code": status,
+        "ok": status == 200,
+        "first_flag": data.get("first") if data else None,
+        "last_flag": data.get("last") if data else None,
+        "page_number": data.get("number") if data else None,
+        "raw_metadata": json.dumps({k: v for k, v in (data or {}).items() if k != "content"}, ensure_ascii=False) if data else None,
+        "error": error,
+        "elapsed_ms": elapsed_ms,
+        "retry_after": retry_after,
+    }
+
+
+def request_log_row(page: int, status: int, elapsed_ms: Optional[float], retry_after: Optional[str], error: Optional[str], initial_page: bool = False) -> Dict[str, Any]:
+    return {
+        "endpoint": "devices_udiDiData_list",
+        "page": page,
+        "status_code": status,
+        "elapsed_ms": elapsed_ms,
+        "retry_after": retry_after,
+        "error": error,
+        "requested_at_utc": iso_utc_now(),
+        "probe": False,
+        "initial_page": initial_page,
+    }
+
+
+def page_audit_row(page: int, status: int, data: Optional[Dict[str, Any]], rows: List[Dict[str, Any]], elapsed_ms: Optional[float], error: Optional[str], initial_page: bool = False) -> Dict[str, Any]:
+    return {
+        "page": page,
+        "status_code": status,
+        "ok": status == 200,
+        "rows_returned": len(rows),
+        "api_number": data.get("number") if data else None,
+        "api_first": data.get("first") if data else None,
+        "api_last": data.get("last") if data else None,
+        "api_total_elements": data.get("totalElements") if data else None,
+        "api_total_pages": data.get("totalPages") if data else None,
+        "elapsed_ms": elapsed_ms,
+        "error": error,
+        "initial_page": initial_page,
+    }
+
+
+def fetch_incremental(client: EudamedClient, initial_data: Dict[str, Any], initial_meta: Dict[str, Any], known_max_ulid: str, extract_date: str, extract_ts: str, known_pages_to_stop: int, extra_pages_after_match: int, max_pages: int = 0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], bool]:
+    total_pages = int(initial_meta.get("total_pages") or 0)
+    if max_pages and max_pages > 0:
+        total_pages = min(total_pages, max_pages)
+    received_rows: List[Dict[str, Any]] = []
+    page_audit: List[Dict[str, Any]] = []
+    request_log: List[Dict[str, Any]] = []
+    frontier_reached = False
+    consecutive_known_only = 0
+    known_or_mixed_pages_seen = 0
+    normal_completion = False
     stop_reason = None
+
     log(f"=== Incremental from known max_ulid={known_max_ulid} ({decode_ulid(known_max_ulid)}) ===")
 
-    def process_page(page: int, probe: bool = False):
-        nonlocal new_rows
-        if page == 0 and prefetched_page0 is not None:
-            status = 200
-            data = prefetched_page0
-            error = None
-            elapsed_ms = (prefetched_request0 or {}).get("elapsed_ms")
-            retry_after = (prefetched_request0 or {}).get("retry_after")
-        else:
+    def process_page(page: int, data: Optional[Dict[str, Any]] = None, initial: bool = False) -> Tuple[bool, int, int, int]:
+        if data is None:
             _, status, data, error, elapsed_ms, retry_after = client.fetch_page(page)
-        rows = parse_page(data, page, extract_ts) if data else []
-        new_candidates = [r for r in rows if (r.get("ulid") or "") > known_max_ulid]
-        added = 0
-        if not probe:
-            for r in new_candidates:
-                u = r.get("uuid")
-                if u and u not in existing_uuid:
-                    existing_uuid.add(u)
-                    new_rows.append(r)
-                    added += 1
-        page_audit.append({
-            "page": page, "status_code": status, "ok": status == 200, "rows_returned": len(rows),
-            "new_candidates": len(new_candidates), "new_added": added,
-            "known_or_old": len(rows) - len(new_candidates),
-            "api_number": data.get("number") if data else None,
-            "api_first": data.get("first") if data else None,
-            "api_last": data.get("last") if data else None,
-            "api_total_elements": data.get("totalElements") if data else None,
-            "api_total_pages": data.get("totalPages") if data else None,
-            "elapsed_ms": elapsed_ms, "error": error, "probe": probe,
-        })
-        request_log.append({
-            "endpoint": "devices_udiDiData_list", "page": page, "status_code": status,
-            "elapsed_ms": elapsed_ms, "retry_after": retry_after, "error": error,
-            "requested_at_utc": iso_utc_now(), "probe": probe,
-            "initial_page": bool(page == 0 and prefetched_page0 is not None),
-        })
-        return len(rows), len(new_candidates), added
+        else:
+            status, error, elapsed_ms, retry_after = 200, None, initial_meta.get("elapsed_ms"), initial_meta.get("retry_after")
+        rows = parse_page(data, page, extract_date, extract_ts) if data else []
+        new_candidates = [r for r in rows if (str(r.get("ulid") or "") > str(known_max_ulid or ""))]
+        received_rows.extend(new_candidates)
+        page_audit.append(page_audit_row(page, status, data, rows, elapsed_ms, error, initial_page=initial))
+        request_log.append(request_log_row(page, status, elapsed_ms, retry_after, error, initial_page=initial))
+        ok = status == 200
+        return ok, len(rows), len(new_candidates), len(rows) - len(new_candidates)
 
     page = 0
     while page < total_pages:
-        rows_n, new_n, added = process_page(page, probe=False)
-        known_n = rows_n - new_n
-        log(f"Incremental page={page} rows={rows_n} new={new_n} added={added} known_or_old={known_n}")
+        ok, rows_n, new_n, known_n = process_page(page, data=initial_data if page == 0 else None, initial=(page == 0))
+        if not ok:
+            stop_reason = f"page_{page}_fetch_failed"
+            break
+        log(f"Incremental page={page} rows={rows_n} new={new_n} added={new_n} known_or_old={known_n}")
         if rows_n == 0:
             stop_reason = "empty_page"
             break
@@ -594,106 +532,111 @@ def fetch_incremental(client: EudamedClient, existing_rows: List[Dict[str, Any]]
         consecutive_known_only = consecutive_known_only + 1 if new_n == 0 else 0
         if frontier_reached and consecutive_known_only >= known_pages_to_stop + extra_pages_after_match:
             stop_reason = "frontier_reached_extra_known_pages_exhausted"
+            normal_completion = True
             break
         page += 1
-    if stop_reason is None:
-        stop_reason = "max_pages_guard_reached"
-
-    diff = len(existing_rows) + len(new_rows) - api_total_elements
-    mismatch_probe = {
-        "executed": False, "head_probe_pages_requested": mismatch_probe_head_pages,
-        "tail_probe_pages_requested": mismatch_probe_tail_pages, "head_probe_pages_fetched": 0,
-        "tail_probe_pages_fetched": 0, "head_probe_new_rows": 0, "tail_probe_new_rows": 0,
-        "head_probe_new_rows_added": 0, "tail_probe_new_rows_added": 0,
-        "tail_first_page": None, "tail_last_page": None, "tail_last_page_rows": None,
-        "difference_before_probe": diff, "difference_after_probe": diff, "api_drift_suspected": False,
-    }
-
-    if diff != 0:
-        mismatch_probe["executed"] = True
-        log(f"WARNING mismatch before probes old+new={len(existing_rows)+len(new_rows):,} api_total={api_total_elements:,} diff={diff}")
-
-        for p in range(0, min(mismatch_probe_head_pages, total_pages)):
-            before = len(new_rows)
-            rows_n, new_n, added = process_page(p, probe=False)
-            mismatch_probe["head_probe_pages_fetched"] += 1
-            mismatch_probe["head_probe_new_rows"] += new_n
-            mismatch_probe["head_probe_new_rows_added"] += len(new_rows) - before
-
-        tail_start = max(0, total_pages - mismatch_probe_tail_pages)
-        mismatch_probe["tail_first_page"] = tail_start
-        mismatch_probe["tail_last_page"] = total_pages - 1
-        for p in range(tail_start, total_pages):
-            before = len(new_rows)
-            rows_n, new_n, added = process_page(p, probe=False)
-            mismatch_probe["tail_probe_pages_fetched"] += 1
-            mismatch_probe["tail_probe_new_rows"] += new_n
-            mismatch_probe["tail_probe_new_rows_added"] += len(new_rows) - before
-            if p == total_pages - 1:
-                mismatch_probe["tail_last_page_rows"] = rows_n
-
-        diff = len(existing_rows) + len(new_rows) - api_total_elements
-        mismatch_probe["difference_after_probe"] = diff
-        mismatch_probe["api_drift_suspected"] = diff != 0 and abs(diff) < client.page_size
+    else:
+        stop_reason = "all_pages_scanned"
+        normal_completion = True
 
     audit = {
         "mode": "incremental",
         "known_max_ulid_before": known_max_ulid,
         "known_max_ulid_before_timestamp": decode_ulid(known_max_ulid),
-        "old_rows": len(existing_rows),
-        "api_total_elements": api_total_elements,
-        "pages_fetched": page + 1,
-        "new_rows_appended": len(new_rows),
+        "api_total_elements": initial_meta.get("total_elements"),
+        "api_total_pages": initial_meta.get("total_pages"),
+        "pages_fetched": len([r for r in page_audit if r.get("ok")]),
+        "new_rows_received": len(received_rows),
         "frontier_reached": frontier_reached,
         "known_or_mixed_pages_seen": known_or_mixed_pages_seen,
         "consecutive_known_only_pages_at_stop": consecutive_known_only,
         "known_pages_to_stop": known_pages_to_stop,
         "extra_pages_after_match": extra_pages_after_match,
-        "mismatch_probe_head_pages": mismatch_probe_head_pages,
-        "mismatch_probe_tail_pages": mismatch_probe_tail_pages,
         "stop_reason": stop_reason,
-        "mismatch_probe": mismatch_probe,
-        "expected_after_append": len(existing_rows) + len(new_rows),
-        "expected_after_append_minus_api_total": len(existing_rows) + len(new_rows) - api_total_elements,
+        "normal_completion": normal_completion,
     }
-    return dedupe_by_uuid(existing_rows + new_rows), page_audit, request_log, audit
+    return received_rows, page_audit, request_log, audit, normal_completion
 
 
-def write_duckdb(out_db: Path, rows: List[Dict[str, Any]], discovery: Dict[str, Any], page_audit: List[Dict[str, Any]], request_log: List[Dict[str, Any]], stats: Dict[str, Any]) -> None:
+def fetch_full(client: EudamedClient, initial_data: Dict[str, Any], initial_meta: Dict[str, Any], extract_date: str, extract_ts: str, max_pages: int = 0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], bool]:
+    total_pages = int(initial_meta.get("total_pages") or 0)
+    if max_pages and max_pages > 0:
+        total_pages = min(total_pages, max_pages)
+    received_rows: List[Dict[str, Any]] = []
+    page_audit: List[Dict[str, Any]] = []
+    request_log: List[Dict[str, Any]] = []
+    failed_pages: List[int] = []
+    normal_completion = True
+
+    log(f"=== Full fetch pages 0..{total_pages - 1} ({total_pages} pages) ===")
+    for page in range(total_pages):
+        if page == 0:
+            status, data, error, elapsed_ms, retry_after = 200, initial_data, None, initial_meta.get("elapsed_ms"), initial_meta.get("retry_after")
+        else:
+            _, status, data, error, elapsed_ms, retry_after = client.fetch_page(page)
+        rows = parse_page(data, page, extract_date, extract_ts) if data else []
+        if status == 200:
+            received_rows.extend(rows)
+        else:
+            failed_pages.append(page)
+            normal_completion = False
+            log(f"WARNING full fetch stopped at page={page}; status={status}; error={error}")
+            break
+        page_audit.append(page_audit_row(page, status, data, rows, elapsed_ms, error, initial_page=(page == 0)))
+        request_log.append(request_log_row(page, status, elapsed_ms, retry_after, error, initial_page=(page == 0)))
+        if page % 50 == 0 or page == total_pages - 1:
+            log(f"Full fetch page={page}/{total_pages-1} | received_rows={len(received_rows):,}")
+
+    audit = {
+        "mode": "full",
+        "api_total_elements": initial_meta.get("total_elements"),
+        "api_total_pages": initial_meta.get("total_pages"),
+        "pages_fetched": len([r for r in page_audit if r.get("ok")]),
+        "failed_pages": failed_pages,
+        "failed_pages_count": len(failed_pages),
+        "received_rows": len(received_rows),
+        "normal_completion": normal_completion,
+        "stop_reason": "all_pages_fetched" if normal_completion else "page_fetch_failed",
+    }
+    return received_rows, page_audit, request_log, audit, normal_completion
+
+
+def write_duckdb(out_db: Path, rows: List[Dict[str, Any]], initial_page: Dict[str, Any], page_audit: List[Dict[str, Any]], request_log: List[Dict[str, Any]], metadata: Dict[str, Any]) -> None:
     safe_unlink(out_db)
     con = duckdb.connect(str(out_db))
     try:
         con.register("udi_df", pd.DataFrame(rows, columns=UDI_COLUMNS))
         con.execute("CREATE TABLE udi AS SELECT * FROM udi_df")
-        con.register("discovery_df", pd.DataFrame([discovery]))
-        con.execute("CREATE TABLE discovery AS SELECT * FROM discovery_df")
+        con.register("initial_page_df", pd.DataFrame([initial_page]))
+        con.execute("CREATE TABLE initial_page AS SELECT * FROM initial_page_df")
         con.register("page_audit_df", pd.DataFrame(page_audit))
         con.execute("CREATE TABLE page_audit AS SELECT * FROM page_audit_df")
         con.register("api_request_log_df", pd.DataFrame(request_log))
         con.execute("CREATE TABLE api_request_log AS SELECT * FROM api_request_log_df")
-
         field_rows = []
         for col in UDI_COLUMNS:
             field_rows.append({"table_name": "udi", "field_name": col, "non_null_rows": sum(1 for r in rows if r.get(col) is not None), "total_rows": len(rows)})
         con.register("field_inventory_df", pd.DataFrame(field_rows))
         con.execute("CREATE TABLE field_inventory AS SELECT * FROM field_inventory_df")
-
-        con.register("pipeline_stats_df", pd.DataFrame([{
-            "pipeline_version": stats.get("pipeline_version"),
-            "mode": stats.get("mode"),
-            "generated_at_utc": stats.get("generated_at_utc"),
-            "row_count": len(rows),
-            "api_total_elements": stats.get("expected", {}).get("total_elements"),
-            "difference": len(rows) - (stats.get("expected", {}).get("total_elements") or 0),
-        }]))
-        con.execute("CREATE TABLE pipeline_stats AS SELECT * FROM pipeline_stats_df")
+        con.register("metadata_df", pd.DataFrame([flatten_for_table(metadata)]))
+        con.execute("CREATE TABLE pipeline_metadata AS SELECT * FROM metadata_df")
     finally:
         con.close()
 
 
+def flatten_for_table(obj: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in obj.items():
+        if isinstance(v, (dict, list)):
+            out[k] = json.dumps(v, ensure_ascii=False)
+        else:
+            out[k] = v
+    return out
+
+
 def write_csv_zip(zip_path: Path, rows: List[Dict[str, Any]]) -> None:
     safe_unlink(zip_path)
-    tmp = zip_path.parent / "_csv_tmp"
+    tmp = zip_path.parent / "_csv_tmp_platform"
     if tmp.exists():
         shutil.rmtree(tmp)
     ensure_dir(tmp)
@@ -712,71 +655,52 @@ def write_json(path: Path, data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def write_release_notes(path: Path, stats: Dict[str, Any], state: Dict[str, Any]) -> None:
-    inc = stats.get("incremental_audit") or {}
-    exp = stats.get("expected", {})
-    audit = stats.get("page_fetch_audit", {})
+def write_release_notes(path: Path, metadata: Dict[str, Any]) -> None:
+    title = "# EUDAMED Platform Raw"
     lines = [
-        "# EUDAMED Platform Raw",
+        title,
         "",
-        f"Pipeline version: `{stats.get('pipeline_version')}`",
-        f"Mode: `{stats.get('mode')}`",
-        f"Generated at UTC: `{stats.get('generated_at_utc')}`",
+        f"Pipeline version: `{metadata.get('pipeline_version')}`",
+        f"Generated at UTC: `{metadata.get('generated_at_utc')}`",
+        f"Run status: `{metadata.get('run_status')}`",
+        f"Requested mode: `{metadata.get('requested_mode')}`",
+        f"Effective mode: `{metadata.get('effective_mode')}`",
         "",
-        "## Scope",
+        "## Snapshot",
         "",
-        "Raw acquisition only. Current domain: UDI.",
+        f"- API total elements: `{metadata.get('api_total_elements')}`",
+        f"- API total pages: `{metadata.get('api_total_pages')}`",
+        f"- Rows in latest DB: `{metadata.get('row_count')}`",
+        f"- Completeness ratio vs API total: `{metadata.get('completeness_ratio')}`",
         "",
-        "## Validation",
+        "## Merge",
         "",
-        f"- API total elements: `{exp.get('total_elements')}`",
-        f"- API total pages: `{exp.get('total_pages')}`",
-        f"- First page: `{exp.get('first_page')}`",
-        f"- Last page: `{exp.get('last_page')}`",
-        f"- Rows in DB: `{state.get('row_count')}`",
-        f"- Difference: `{audit.get('received_rows_difference')}`",
-        f"- Completeness ratio: `{state.get('completeness_ratio')}`",
+        f"- Previous rows: `{metadata.get('merge', {}).get('previous_rows')}`",
+        f"- Received rows this run: `{metadata.get('merge', {}).get('received_rows')}`",
+        f"- Inserted UUIDs: `{metadata.get('merge', {}).get('inserted_uuid_count')}`",
+        f"- Refreshed UUIDs: `{metadata.get('merge', {}).get('refreshed_uuid_count')}`",
+        f"- Retained UUIDs from previous latest: `{metadata.get('merge', {}).get('retained_uuid_count')}`",
+        f"- Merged rows: `{metadata.get('merge', {}).get('merged_rows')}`",
         "",
         "## ULID range",
         "",
-        f"- Min ULID: `{state.get('min_ulid')}` → `{state.get('min_ulid_timestamp')}`",
-        f"- Max ULID: `{state.get('max_ulid')}` → `{state.get('max_ulid_timestamp')}`",
+        f"- Min ULID: `{metadata.get('min_ulid')}` → `{metadata.get('min_ulid_timestamp')}`",
+        f"- Max ULID: `{metadata.get('max_ulid')}` → `{metadata.get('max_ulid_timestamp')}`",
+        "",
+        "## Audit",
+        "",
+        f"- Normal completion: `{metadata.get('normal_completion')}`",
+        f"- Stop reason: `{metadata.get('audit', {}).get('stop_reason')}`",
+        f"- Pages fetched: `{metadata.get('audit', {}).get('pages_fetched')}`",
+        f"- Failed pages: `{metadata.get('audit', {}).get('failed_pages_count', 0)}`",
+        "",
+        "## Interpretation",
+        "",
+        "- `COMPLETE` means the selected mode reached normal completion.",
+        "- `PARTIAL` means some useful data was received, but the selected mode did not reach normal completion. Latest is still merged with previous latest so data is not lost.",
+        "- `BOOTSTRAP` means no previous latest DB was available and a full base was created.",
+        "- `FAILED` means no usable data was received; latest should not be updated.",
     ]
-    if inc:
-        lines.extend([
-            "",
-            "## Incremental audit",
-            "",
-            f"- Known max ULID before: `{inc.get('known_max_ulid_before')}` → `{inc.get('known_max_ulid_before_timestamp')}`",
-            f"- Old rows: `{inc.get('old_rows')}`",
-            f"- New rows appended: `{inc.get('new_rows_appended')}`",
-            f"- Frontier reached: `{inc.get('frontier_reached')}`",
-            f"- Stop reason: `{inc.get('stop_reason')}`",
-            f"- Expected after append minus API total: `{inc.get('expected_after_append_minus_api_total')}`",
-        ])
-        mp = inc.get("mismatch_probe") or {}
-        if mp:
-            lines.extend([
-                "",
-                "## Mismatch probes",
-                "",
-                f"- Executed: `{mp.get('executed')}`",
-                f"- Head probe pages fetched: `{mp.get('head_probe_pages_fetched')}`",
-                f"- Head probe new rows added: `{mp.get('head_probe_new_rows_added')}`",
-                f"- Tail probe pages fetched: `{mp.get('tail_probe_pages_fetched')}`",
-                f"- Tail probe new rows added: `{mp.get('tail_probe_new_rows_added')}`",
-                f"- Tail last page rows: `{mp.get('tail_last_page_rows')}`",
-                f"- Difference before probe: `{mp.get('difference_before_probe')}`",
-                f"- Difference after probe: `{mp.get('difference_after_probe')}`",
-                f"- API drift suspected: `{mp.get('api_drift_suspected')}`",
-            ])
-    lines.extend([
-        "",
-        "## Notes",
-        "",
-        "- CDC, canonical merge and DK subset are intentionally out of scope.",
-        "- Latest release is recreated on every successful run.",
-    ])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -785,7 +709,7 @@ def copy_file(src: Path, dst: Path) -> None:
     shutil.copy2(src, dst)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["incremental", "full"], default="incremental")
     p.add_argument("--out-dir", default="dist/eudamed_platform_raw")
@@ -794,297 +718,219 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--language", default="en")
     p.add_argument("--page-size", type=int, default=300)
     p.add_argument("--max-pages", type=int, default=0)
-    p.add_argument("--workers", type=int, default=12)
-    p.add_argument("--max-rps", type=float, default=3.0)
+    p.add_argument("--max-rps", type=float, default=1.0)
     p.add_argument("--timeout", type=int, default=60)
     p.add_argument("--retries", type=int, default=4)
     p.add_argument("--backoff", type=float, default=1.5)
-    p.add_argument("--discovery-retries", type=int, default=8)
-    p.add_argument("--discovery-retry-pause", type=float, default=30.0)
     p.add_argument("--known-pages-to-stop", type=int, default=5)
     p.add_argument("--extra-pages-after-match", type=int, default=10)
-    p.add_argument("--mismatch-probe-head-pages", type=int, default=50)
-    p.add_argument("--mismatch-probe-tail-pages", type=int, default=50)
     p.add_argument("--release-timestamp", default=None)
     p.add_argument("--skip-csv-zip", action="store_true")
-    args = p.parse_args(argv)
+    return p.parse_args(argv)
 
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
     out_dir = Path(args.out_dir)
     inputs_dir = Path(args.inputs_dir)
     ensure_dir(out_dir)
     ensure_dir(inputs_dir)
     rel_ts = release_timestamp(args.release_timestamp)
     extract_ts = iso_utc_now()
+    extract_date = extract_ts[:10]
 
     log(f"=== EUDAMED Platform Raw {PIPELINE_VERSION} acquisition started ===")
-    log(f"mode={args.mode} out_dir={out_dir} page_size={args.page_size}")
+    log(f"requested_mode={args.mode} out_dir={out_dir} page_size={args.page_size}")
     log("scope=raw_fetch_only cdc=0 canonical=0 dk_subset=0 domain=udi")
 
-    # Bootstrap state/DB before API discovery so transient EU web-filter failures do not hard-fail a run.
-    previous_state = read_state_file(inputs_dir)
     existing_db = find_existing_db(inputs_dir)
     existing_rows: List[Dict[str, Any]] = []
-    bootstrap = {}
     if existing_db:
-        log(f"Previous raw DB found for bootstrap: {existing_db}")
-        bootstrap = bootstrap_from_db(existing_db)
-        log(json.dumps(bootstrap, ensure_ascii=False))
-        # Load rows for incremental append and for no-op fallback if discovery is blocked.
+        log(f"Previous Platform Raw latest DB found: {existing_db}")
         existing_rows = read_existing_rows(existing_db)
-        log(f"Loaded existing rows: {len(existing_rows):,}")
+        log(f"Loaded previous rows: {len(existing_rows):,}")
+    else:
+        log("No previous Platform Raw latest DB found")
 
-    known_max = None
-    if previous_state and previous_state.get("max_ulid"):
-        known_max = previous_state.get("max_ulid")
-        log(f"Using max_ulid from state: {known_max} ({decode_ulid(known_max)})")
-    elif bootstrap.get("max_ulid"):
-        known_max = bootstrap.get("max_ulid")
-        log(f"Using max_ulid from DB: {known_max} ({decode_ulid(known_max)})")
+    previous_max_ulid = max_ulid(r.get("ulid") for r in existing_rows)
+    effective_mode = args.mode
+    bootstrap = False
+    if args.mode == "incremental" and not existing_rows:
+        effective_mode = "full"
+        bootstrap = True
+        log("Incremental requested but no previous DB exists. Falling back to BOOTSTRAP full crawl.")
+    elif args.mode == "incremental" and not previous_max_ulid:
+        effective_mode = "full"
+        bootstrap = True
+        log("Incremental requested but previous DB has no max ULID. Falling back to BOOTSTRAP full crawl.")
 
     client = EudamedClient(args.base_url, args.language, args.page_size, args.timeout, args.retries, args.backoff, args.max_rps)
 
     log("=== Initial page fetch page=0 ===")
-    initial_page, initial_page_data, initial_request_row = client.initial_page_fetch()
-    log(json.dumps(initial_page, ensure_ascii=False))
+    page, status, initial_data, error, elapsed_ms, retry_after = client.fetch_page(0)
+    initial_meta = initial_page_record(initial_data, status, error, elapsed_ms, retry_after, args.page_size)
+    log(json.dumps(initial_meta, ensure_ascii=False))
 
-    discovery = {
-        "discovered_at_utc": initial_page.get("fetched_at_utc"),
-        "requested_page_size": initial_page.get("requested_page_size"),
-        "response_page_size": initial_page.get("response_page_size"),
-        "total_elements": initial_page.get("total_elements"),
-        "total_pages": initial_page.get("total_pages"),
-        "first_page_number_of_elements": initial_page.get("number_of_elements"),
-        "first_page_content_length": initial_page.get("content_length"),
-        "first_page_status_code": initial_page.get("status_code"),
-        "first_page_ok": initial_page.get("ok"),
-        "first_page_first_flag": initial_page.get("first_flag"),
-        "first_page_last_flag": initial_page.get("last_flag"),
-        "first_page_number": initial_page.get("page_number"),
-        "raw_metadata": initial_page.get("raw_metadata"),
-        "first_page_error": initial_page.get("error"),
-    }
-
-    discovery_failed = not bool(initial_page.get("ok"))
-    if discovery_failed:
-        log("WARNING discovery failed after retries")
-        if not existing_rows:
-            log("ERROR discovery failed and no previous DB/state rows are available")
-            return 2
-        # No-op fallback: release the previous DB content with warning metadata instead of failing.
-        fallback_total = int((previous_state or {}).get("api_total_elements") or bootstrap.get("row_count") or len(existing_rows))
-        fallback_pages = int((previous_state or {}).get("api_total_pages") or 0)
-        discovery = {
-            "discovered_at_utc": iso_utc_now(),
-            "requested_page_size": args.page_size,
-            "response_page_size": None,
-            "total_elements": fallback_total,
-            "total_pages": fallback_pages,
-            "first_page_number_of_elements": None,
-            "first_page_content_length": 0,
-            "first_page_status_code": None,
-            "first_page_ok": False,
-            "first_page_first_flag": None,
-            "first_page_last_flag": None,
-            "first_page_number": None,
-            "raw_metadata": None,
-            "first_page_error": "Discovery failed after retries; reused previous raw DB content.",
+    if status != 200 or not initial_data:
+        metadata = {
+            "pipeline_version": PIPELINE_VERSION,
+            "release_timestamp": rel_ts,
+            "generated_at_utc": iso_utc_now(),
+            "run_status": RUN_FAILED,
+            "requested_mode": args.mode,
+            "effective_mode": effective_mode,
+            "error": error,
+            "initial_page": initial_meta,
+            "row_count": 0,
         }
-        total_elements = fallback_total
-        total_pages = fallback_pages
-        rows = existing_rows
-        page_audit = []
-        request_log = []
-        incremental_audit = {
-            "mode": args.mode,
-            "known_max_ulid_before": known_max,
-            "known_max_ulid_before_timestamp": decode_ulid(known_max),
-            "old_rows": len(existing_rows),
-            "api_total_elements": total_elements,
-            "pages_fetched": 0,
-            "new_rows_appended": 0,
-            "frontier_reached": False,
-            "stop_reason": "discovery_failed_noop_reuse_previous_db",
-            "expected_after_append": len(existing_rows),
-            "expected_after_append_minus_api_total": len(existing_rows) - total_elements,
-            "discovery_failed": True,
+        write_json(out_dir / f"eudamed_platform_raw_{rel_ts}.metadata.json", metadata)
+        write_json(out_dir / "eudamed_platform_raw_latest.metadata.json", metadata)
+        write_release_notes(out_dir / "RELEASE_NOTES_EUDAMED_PLATFORM_RAW.md", metadata)
+        log("ERROR page 0 failed. RUN_STATUS=FAILED. Latest should not be updated.")
+        return 2
+
+    api_total_elements = int(initial_meta.get("total_elements") or 0)
+    api_total_pages = int(initial_meta.get("total_pages") or 0)
+
+    if effective_mode == "incremental":
+        received_rows, page_audit, request_log, audit, normal_completion = fetch_incremental(
+            client, initial_data, initial_meta, str(previous_max_ulid), extract_date, extract_ts,
+            args.known_pages_to_stop, args.extra_pages_after_match, max_pages=args.max_pages
+        )
+    else:
+        received_rows, page_audit, request_log, audit, normal_completion = fetch_full(
+            client, initial_data, initial_meta, extract_date, extract_ts, max_pages=args.max_pages
+        )
+
+    # A manual max_pages cap is a test/partial scope unless the cap is at or above the API total pages.
+    if args.max_pages and args.max_pages > 0 and args.max_pages < api_total_pages:
+        if audit.get("stop_reason") == "all_pages_scanned":
+            audit["stop_reason"] = "max_pages_cap_reached"
+        if effective_mode == "full":
+            normal_completion = False
+
+    if not received_rows:
+        run_status = RUN_FAILED
+    elif bootstrap and normal_completion:
+        run_status = RUN_BOOTSTRAP
+    elif normal_completion:
+        run_status = RUN_COMPLETE
+    else:
+        run_status = RUN_PARTIAL
+
+    if run_status == RUN_FAILED:
+        merged_rows = existing_rows
+        merge_stats = {
+            "previous_rows": len(existing_rows),
+            "received_rows": 0,
+            "previous_uuid_count": len({r.get("uuid") for r in existing_rows if r.get("uuid")}),
+            "received_uuid_count": 0,
+            "inserted_uuid_count": 0,
+            "refreshed_uuid_count": 0,
+            "retained_uuid_count": len({r.get("uuid") for r in existing_rows if r.get("uuid")}),
+            "merged_rows": len(existing_rows),
+        }
+    elif run_status in {RUN_COMPLETE, RUN_BOOTSTRAP} and effective_mode == "full":
+        # A complete full run is the new full truth. No previous rows need to be retained.
+        merged_rows = dedupe_by_uuid_choose_latest(received_rows)
+        merge_stats = {
+            "previous_rows": len(existing_rows),
+            "received_rows": len(received_rows),
+            "previous_uuid_count": len({r.get("uuid") for r in existing_rows if r.get("uuid")}),
+            "received_uuid_count": len({r.get("uuid") for r in received_rows if r.get("uuid")}),
+            "inserted_uuid_count": len({r.get("uuid") for r in received_rows if r.get("uuid")} - {r.get("uuid") for r in existing_rows if r.get("uuid")}),
+            "refreshed_uuid_count": len({r.get("uuid") for r in received_rows if r.get("uuid")} & {r.get("uuid") for r in existing_rows if r.get("uuid")}),
+            "retained_uuid_count": 0,
+            "merged_rows": len(merged_rows),
         }
     else:
-        log("=== Initial page fetch complete ===")
-        total_elements = int(discovery.get("total_elements") or 0)
-        total_pages = int(discovery.get("total_pages") or 0)
-        if args.max_pages and args.max_pages > 0:
-            total_pages = min(total_pages, args.max_pages)
+        # Incremental complete/partial, or full partial: merge safely with previous latest.
+        merged_rows, merge_stats = merge_rows(existing_rows, received_rows)
 
-        if args.mode == "incremental" and not known_max:
-            log("WARNING no max_ulid found; fallback to full mode")
-            args.mode = "full"
-
-        initial_rows = parse_page(initial_page_data, 0, extract_ts) if initial_page_data else []
-        initial_page_audit = [{
-            "page": 0,
-            "status_code": initial_page.get("status_code"),
-            "ok": bool(initial_page.get("ok")),
-            "rows_returned": len(initial_rows),
-            "api_number": initial_page.get("page_number"),
-            "api_first": initial_page.get("first_flag"),
-            "api_last": initial_page.get("last_flag"),
-            "api_total_elements": initial_page.get("total_elements"),
-            "api_total_pages": initial_page.get("total_pages"),
-            "elapsed_ms": initial_request_row.get("elapsed_ms"),
-            "error": initial_page.get("error"),
-            "initial_page": True,
-        }]
-
-        if args.mode == "full":
-            rest_rows, rest_page_audit, rest_request_log = fetch_full(client, total_pages, args.workers, extract_ts, start_page=1)
-            rows = initial_rows + rest_rows
-            page_audit = initial_page_audit + rest_page_audit
-            request_log = [initial_request_row] + rest_request_log
-            incremental_audit = None
-        else:
-            rows, page_audit, request_log, incremental_audit = fetch_incremental(
-                client, existing_rows, known_max, total_elements, total_pages, extract_ts,
-                args.known_pages_to_stop, args.extra_pages_after_match,
-                args.mismatch_probe_head_pages, args.mismatch_probe_tail_pages,
-                prefetched_page0=initial_page_data,
-                prefetched_request0=initial_request_row,
-            )
-
-    rows = dedupe_by_uuid(rows)
-    row_count = len(rows)
-    uuids = [r.get("uuid") for r in rows if r.get("uuid")]
-    unique_uuid_count = len(set(uuids))
-    duplicate_uuid_rows = len(uuids) - unique_uuid_count
-    min_u = min_ulid(r.get("ulid") for r in rows)
-    max_u = max_ulid(r.get("ulid") for r in rows)
-    fetched_pages = sorted({r["page"] for r in page_audit if r.get("ok")})
-    missing_pages = [] if args.mode == "incremental" else sorted(set(range(total_pages)) - set(fetched_pages))
-
-    page_fetch_audit = {
-        "requested_pages": len(page_audit),
-        "successful_pages": len(fetched_pages),
-        "failed_pages": sum(1 for r in page_audit if not r.get("ok")),
-        "missing_pages_count": len(missing_pages),
-        "missing_pages_sample": missing_pages[:100],
-        "received_rows": row_count,
-        "unique_device_uuid": unique_uuid_count,
-        "duplicate_device_uuid_rows": duplicate_uuid_rows,
-        "expected_rows_for_scope": total_elements,
-        "received_rows_difference": row_count - total_elements,
-        "received_equals_expected_for_scope": row_count == total_elements,
-        "successful_pages_equals_requested_pages": len(fetched_pages) == len(page_audit),
-    }
-
-    state = {
-        "pipeline_version": PIPELINE_VERSION,
-        "release_timestamp": rel_ts,
-        "crawl_mode": args.mode,
-        "completed_at_utc": iso_utc_now(),
-        "max_ulid": max_u,
-        "max_ulid_timestamp": decode_ulid(max_u),
-        "min_ulid": min_u,
-        "min_ulid_timestamp": decode_ulid(min_u),
-        "row_count": row_count,
-        "api_total_elements": total_elements,
-        "api_total_pages": total_pages,
-        "page_size": args.page_size,
-        "first_page": 0,
-        "last_page": total_pages - 1,
-        "first_page_first_flag": discovery.get("first_page_first_flag"),
-        "first_page_last_flag": discovery.get("first_page_last_flag"),
-        "first_page_number": discovery.get("first_page_number"),
-        "completeness_ratio": (row_count / total_elements) if total_elements else None,
-        "bootstrap": {
-            "state_found": bool(previous_state),
-            "db_found": str(existing_db) if existing_db else None,
-            "legacy_compatible": True,
-            "bootstrap_max_ulid": known_max,
-            "bootstrap_max_ulid_timestamp": decode_ulid(known_max),
-        },
-        "audit": incremental_audit,
-    }
-
-    status_summary = {}
+    row_count = len(merged_rows)
+    min_u = min_ulid(r.get("ulid") for r in merged_rows)
+    max_u = max_ulid(r.get("ulid") for r in merged_rows)
+    completeness_ratio = (row_count / api_total_elements) if api_total_elements else None
+    status_summary: Dict[Tuple[str, int], int] = {}
     for r in request_log:
-        key = (r.get("endpoint"), int(r.get("status_code") or 0))
+        key = (r.get("endpoint", ""), int(r.get("status_code") or 0))
         status_summary[key] = status_summary.get(key, 0) + 1
 
-    stats = {
-        "generated_at_utc": iso_utc_now(),
+    metadata = {
         "pipeline_version": PIPELINE_VERSION,
         "release_timestamp": rel_ts,
-        "mode": args.mode,
+        "release_time_utc": release_title_time(rel_ts),
+        "generated_at_utc": iso_utc_now(),
+        "run_status": run_status,
+        "requested_mode": args.mode,
+        "effective_mode": effective_mode,
+        "bootstrap": bootstrap,
         "base_url": args.base_url,
         "language": args.language,
-        "page_size_requested": args.page_size,
-        "page_size_response": discovery.get("response_page_size"),
+        "page_size": args.page_size,
         "max_pages": args.max_pages,
-        "workers": args.workers,
         "max_rps": args.max_rps,
         "retries": args.retries,
-        "backoff": args.backoff,
-        "discovery_retries": args.discovery_retries,
-        "discovery_retry_pause": args.discovery_retry_pause,
-        "discovery_failed": bool(discovery_failed),
-        "initial_page_fetch_used_as_data": True,
-        "csv_zip_skipped": bool(args.skip_csv_zip),
-        "expected": {"total_elements": total_elements, "total_pages": total_pages, "first_page": 0, "last_page": total_pages - 1},
-        "page_fetch_audit": page_fetch_audit,
-        "incremental_audit": incremental_audit,
-        "state": state,
-        "rows": {"discovery": 1, "page_audit": len(page_audit), "udi": row_count, "actors": 0, "api_request_log": len(request_log), "field_inventory": len(UDI_COLUMNS)},
-        "columns": {"udi": len(UDI_COLUMNS)},
+        "api_total_elements": api_total_elements,
+        "api_total_pages": api_total_pages,
+        "row_count": row_count,
+        "completeness_ratio": completeness_ratio,
+        "min_ulid": min_u,
+        "min_ulid_timestamp": decode_ulid(min_u),
+        "max_ulid": max_u,
+        "max_ulid_timestamp": decode_ulid(max_u),
+        "previous_db_found": str(existing_db) if existing_db else None,
+        "previous_rows": len(existing_rows),
+        "received_rows": len(received_rows),
+        "normal_completion": normal_completion,
+        "initial_page": initial_meta,
+        "audit": audit,
+        "merge": merge_stats,
         "request_status_summary": [{"endpoint": k[0], "status_code": k[1], "count": v} for k, v in sorted(status_summary.items())],
     }
 
-    if row_count != total_elements:
-        log("WARNING completeness mismatch. Warning-only; release continues.")
-    log(f"Validation summary | api_total={total_elements:,} db_rows={row_count:,} diff={row_count-total_elements}")
+    latest_db = out_dir / "eudamed_platform_raw_latest.duckdb"
+    latest_csv = out_dir / "eudamed_platform_raw_latest_csv.zip"
+    latest_meta = out_dir / "eudamed_platform_raw_latest.metadata.json"
+    latest_notes = out_dir / "RELEASE_NOTES_EUDAMED_PLATFORM_RAW.md"
+    dated_db = out_dir / f"eudamed_platform_raw_{rel_ts}.duckdb"
+    dated_csv = out_dir / f"eudamed_platform_raw_{rel_ts}_csv.zip"
+    dated_meta = out_dir / f"eudamed_platform_raw_{rel_ts}.metadata.json"
+    dated_notes = out_dir / f"RELEASE_NOTES_EUDAMED_PLATFORM_RAW_{rel_ts}.md"
 
-    latest_db = out_dir / "eudamed_platform_raw.duckdb"
-    latest_csv = out_dir / "eudamed_platform_raw.csv.zip"
-    latest_state = out_dir / "eudamed_platform_raw_state.json"
-    latest_stats = out_dir / "eudamed_platform_raw_stats.json"
-    latest_notes = out_dir / "release_notes.md"
+    if run_status == RUN_FAILED:
+        log("RUN_STATUS=FAILED. Writing metadata/notes only; not writing latest DB.")
+        write_json(latest_meta, metadata)
+        write_json(dated_meta, metadata)
+        write_release_notes(latest_notes, metadata)
+        write_release_notes(dated_notes, metadata)
+        return 2
 
     log(f"Writing DuckDB: {latest_db}")
-    t0 = time.monotonic()
-    write_duckdb(latest_db, rows, discovery, page_audit, request_log, stats)
-    log(f"DuckDB finished in {time.monotonic()-t0:.0f}s | size={file_size(latest_db)}")
-
+    write_duckdb(latest_db, merged_rows, initial_meta, page_audit, request_log, metadata)
     if not args.skip_csv_zip:
         log(f"Writing CSV ZIP: {latest_csv}")
-        t0 = time.monotonic()
-        write_csv_zip(latest_csv, rows)
-        log(f"CSV ZIP finished in {time.monotonic()-t0:.0f}s | size={file_size(latest_csv)}")
-
-    write_json(latest_state, state)
-    write_json(latest_stats, stats)
-    write_release_notes(latest_notes, stats, state)
-
-    dated_db = out_dir / f"eudamed_platform_raw_{rel_ts}.duckdb"
-    dated_csv = out_dir / f"eudamed_platform_raw_{rel_ts}.csv.zip"
-    dated_state = out_dir / f"eudamed_platform_raw_state_{rel_ts}.json"
-    dated_stats = out_dir / f"eudamed_platform_raw_stats_{rel_ts}.json"
-    dated_notes = out_dir / f"release_notes_{rel_ts}.md"
+        write_csv_zip(latest_csv, merged_rows)
+    write_json(latest_meta, metadata)
+    write_release_notes(latest_notes, metadata)
 
     copy_file(latest_db, dated_db)
     if latest_csv.exists():
         copy_file(latest_csv, dated_csv)
-    copy_file(latest_state, dated_state)
-    copy_file(latest_stats, dated_stats)
+    copy_file(latest_meta, dated_meta)
     copy_file(latest_notes, dated_notes)
 
-    stats["output_files"] = [p.name for p in [latest_db, latest_csv, latest_state, latest_stats, latest_notes, dated_db, dated_csv, dated_state, dated_stats, dated_notes] if p.exists()]
-    stats["duckdb_export"] = str(latest_db)
-    stats["csv_zip"] = str(latest_csv) if latest_csv.exists() else None
-    stats["output_file_sizes"] = {"duckdb": file_size(latest_db), "csv_zip": file_size(latest_csv) if latest_csv.exists() else "n/a", "stats_json": file_size(latest_stats)}
-    write_json(latest_stats, stats)
-    copy_file(latest_stats, dated_stats)
-
-    log("=== Final stats ===")
-    log(json.dumps(stats, ensure_ascii=False))
-    log(f"=== Done {PIPELINE_VERSION} ===")
+    log("=== EUDAMED Platform Raw complete ===")
+    log(json.dumps({
+        "run_status": run_status,
+        "requested_mode": args.mode,
+        "effective_mode": effective_mode,
+        "api_total_elements": api_total_elements,
+        "row_count": row_count,
+        "received_rows": len(received_rows),
+        "previous_rows": len(existing_rows),
+        "merge": merge_stats,
+    }, ensure_ascii=False))
     return 0
 
 
