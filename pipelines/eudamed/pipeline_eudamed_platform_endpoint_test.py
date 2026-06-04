@@ -8,7 +8,7 @@ endpoints are reachable from the GitHub runner.
 
 It intentionally performs only one request per endpoint:
 - page=0
-- size=1
+- size=300
 - no pagination
 - no parallelism
 - no retries
