@@ -1,0 +1,78 @@
+name: Pipeline EUDAMED Platform Endpoint Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eudamed-upstream
+  cancel-in-progress: false
+
+env:
+  DATA_REPO: Wakzi/EUDAHUB-Intelligence-Data
+  OUT_DIR: dist/eudamed_platform_endpoint_test
+
+jobs:
+  platform-endpoint-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Lab repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Generate UTC timestamp
+        id: timestamp
+        run: |
+          echo "timestamp=$(date -u +'%Y%m%d_%H%M%S')" >> "$GITHUB_OUTPUT"
+          echo "timestamp_human=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+
+      - name: Run endpoint test
+        run: |
+          python -u pipelines/eudamed/pipeline_eudamed_platform_endpoint_test.py \
+            --out-dir "$OUT_DIR" \
+            --timestamp "${{ steps.timestamp.outputs.timestamp }}"
+
+      - name: List generated files
+        run: |
+          find "$OUT_DIR" -maxdepth 1 -type f -print -exec ls -lh {} \;
+
+      - name: Validate output files
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          test -f "$OUT_DIR/platform_endpoint_test.json"
+          test -f "$OUT_DIR/PLATFORM_ENDPOINT_TEST.md"
+          test -f "$OUT_DIR/platform_endpoint_test_${TS}.json"
+          test -f "$OUT_DIR/PLATFORM_ENDPOINT_TEST_${TS}.md"
+
+      - name: Create dated endpoint test release in Data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          TAG="eudamed-platform-endpoint-test-${TS}"
+          TITLE="EUDAMED Platform Endpoint Test - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$DATA_REPO"
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "$TITLE" \
+            --notes-file "$OUT_DIR/PLATFORM_ENDPOINT_TEST.md" \
+            --latest=false
+
+          gh release upload "$TAG" \
+            "$OUT_DIR/platform_endpoint_test_${TS}.json" \
+            "$OUT_DIR/PLATFORM_ENDPOINT_TEST_${TS}.md" \
+            --repo "$REPO" \
+            --clobber
