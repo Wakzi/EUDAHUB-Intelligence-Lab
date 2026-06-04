@@ -1,0 +1,303 @@
+name: Pipeline EUDAMED Data Lake Raw
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Fetch mode"
+        required: true
+        default: "partitioned"
+        type: choice
+        options:
+          - partitioned
+          - partitioned_trace
+          - full
+          - full_trace
+
+  # Enable later when raw has been tested manually.
+  # schedule:
+  #   - cron: "0 2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eudamed-upstream
+  cancel-in-progress: false
+
+env:
+  DATA_REPO: Wakzi/EUDAHUB-Intelligence-Data
+  NEW_LATEST_TAG: eudamed-datalake-raw-latest
+  LEGACY_SEED_TAG: eudamed-raw-20260603_045834
+
+jobs:
+  fetch-eudamed-raw:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Lab repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate UTC timestamp
+        id: timestamp
+        run: |
+          echo "date=$(date -u +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+          echo "date_compact=$(date -u +'%Y%m%d')" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$(date -u +'%Y%m%d_%H%M%S')" >> "$GITHUB_OUTPUT"
+          echo "timestamp_human=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+
+      - name: Choose run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=partitioned" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download previous Data Lake Raw latest or seed
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p previous_raw
+
+          echo "Trying new latest release: $NEW_LATEST_TAG"
+          if gh release download "$NEW_LATEST_TAG" \
+            --repo "$DATA_REPO" \
+            --pattern "eudamed_datalake_raw_latest.duckdb" \
+            --dir previous_raw \
+            --clobber; then
+
+            gh release download "$NEW_LATEST_TAG" \
+              --repo "$DATA_REPO" \
+              --pattern "eudamed_datalake_raw_latest.metadata.json" \
+              --dir previous_raw \
+              --clobber || true
+
+            echo "OK restored previous Data Lake Raw latest"
+
+          else
+            echo "No new latest found. Bootstrapping from legacy complete seed: $LEGACY_SEED_TAG"
+
+            gh release download "$LEGACY_SEED_TAG" \
+              --repo "$DATA_REPO" \
+              --pattern "eudamed_raw_20260603_045834.duckdb" \
+              --dir previous_raw \
+              --clobber
+
+            gh release download "$LEGACY_SEED_TAG" \
+              --repo "$DATA_REPO" \
+              --pattern "eudamed_raw_20260603_045834.metadata.json" \
+              --dir previous_raw \
+              --clobber || true
+
+            mv previous_raw/eudamed_raw_20260603_045834.duckdb \
+               previous_raw/eudamed_datalake_raw_latest.duckdb
+
+            if [ -f previous_raw/eudamed_raw_20260603_045834.metadata.json ]; then
+              mv previous_raw/eudamed_raw_20260603_045834.metadata.json \
+                 previous_raw/eudamed_datalake_raw_latest.metadata.json
+            fi
+          fi
+
+          if [ -f previous_raw/eudamed_datalake_raw_latest.metadata.json ]; then
+            cp previous_raw/eudamed_datalake_raw_latest.metadata.json previous_raw_metadata.json
+            echo "OK restored previous metadata"
+            cat previous_raw_metadata.json | head -40
+          else
+            echo "INFO no previous metadata found. Schema changes will be baseline."
+            echo "{}" > previous_raw_metadata.json
+          fi
+
+          ls -lh previous_raw
+
+      - name: Run EUDAMED raw pipeline
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python -u pipelines/eudamed/pipeline_eudamed_datalake_raw.py \
+            --mode "${{ steps.mode.outputs.mode }}" \
+            --timestamp "${{ steps.timestamp.outputs.timestamp }}" \
+            --previous-metadata previous_raw_metadata.json \
+            --previous-latest-db previous_raw/eudamed_datalake_raw_latest.duckdb
+
+      - name: List generated files
+        run: |
+          ls -lh
+
+      - name: Validate raw assets exist
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          test -f "eudamed_datalake_raw_latest.duckdb"
+          test -f "eudamed_datalake_raw_latest_csv.zip"
+          test -f "eudamed_datalake_raw_latest.metadata.json"
+          test -f "eudamed_datalake_raw_${TS}.duckdb"
+          test -f "eudamed_datalake_raw_${TS}_csv.zip"
+          test -f "eudamed_datalake_raw_${TS}.metadata.json"
+          test -f "RELEASE_NOTES_EUDAMED_DATALAKE_RAW.md"
+
+      - name: Create or update dated raw release in Data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          TAG="eudamed-datalake-raw-${TS}"
+          TITLE="EUDAMED Data Lake Raw - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$DATA_REPO"
+
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_DATALAKE_RAW.md \
+              --latest=false
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_DATALAKE_RAW.md \
+              --latest=false
+          fi
+
+          for asset in \
+            "eudamed_datalake_raw_${TS}.duckdb" \
+            "eudamed_datalake_raw_${TS}_csv.zip" \
+            "eudamed_datalake_raw_${TS}.metadata.json" \
+            "RELEASE_NOTES_EUDAMED_DATALAKE_RAW.md"
+          do
+            gh release delete-asset "$TAG" "$asset" --repo "$REPO" --yes || true
+          done
+
+          gh release upload "$TAG" \
+            "eudamed_datalake_raw_${TS}.duckdb" \
+            "eudamed_datalake_raw_${TS}_csv.zip" \
+            "eudamed_datalake_raw_${TS}.metadata.json" \
+            RELEASE_NOTES_EUDAMED_DATALAKE_RAW.md \
+            --repo "$REPO" \
+            --clobber
+
+      - name: Recreate latest raw release in Data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TAG="$NEW_LATEST_TAG"
+          TITLE="Latest EUDAMED Data Lake Raw - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$DATA_REPO"
+
+          # GitHub release lists use the release creation/publish time.
+          # Editing an existing latest release does not move it to the top.
+          # Therefore latest releases are deleted and recreated every run.
+          # --latest=false prevents GitHub from marking this as the green repository Latest release.
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag || true
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "$TITLE" \
+            --notes-file RELEASE_NOTES_EUDAMED_DATALAKE_RAW.md \
+            --latest=false
+
+          gh release upload "$TAG" \
+            eudamed_datalake_raw_latest.duckdb \
+            eudamed_datalake_raw_latest_csv.zip \
+            eudamed_datalake_raw_latest.metadata.json \
+            RELEASE_NOTES_EUDAMED_DATALAKE_RAW.md \
+            --repo "$REPO" \
+            --clobber
+
+      - name: Create or update dated trace release in Data repo
+        if: contains(steps.mode.outputs.mode, '_trace')
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          TAG="eudamed-trace-${TS}"
+          TITLE="EUDAMED Trace Research - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$DATA_REPO"
+
+          test -f "eudamed_trace_${TS}.duckdb"
+          test -f "eudamed_trace_${TS}.metadata.json"
+          test -f "RELEASE_NOTES_EUDAMED_TRACE.md"
+
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_TRACE.md \
+              --latest=false
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file RELEASE_NOTES_EUDAMED_TRACE.md \
+              --latest=false
+          fi
+
+          for asset in \
+            "eudamed_trace_${TS}.duckdb" \
+            "eudamed_trace_${TS}.metadata.json" \
+            "RELEASE_NOTES_EUDAMED_TRACE.md"
+          do
+            gh release delete-asset "$TAG" "$asset" --repo "$REPO" --yes || true
+          done
+
+          gh release upload "$TAG" \
+            "eudamed_trace_${TS}.duckdb" \
+            "eudamed_trace_${TS}.metadata.json" \
+            RELEASE_NOTES_EUDAMED_TRACE.md \
+            --repo "$REPO" \
+            --clobber
+
+      - name: Recreate latest trace release in Data repo
+        if: contains(steps.mode.outputs.mode, '_trace')
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TAG="eudamed-trace-latest"
+          TITLE="Latest EUDAMED Trace Research - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$DATA_REPO"
+
+          test -f "eudamed_trace_latest.duckdb"
+          test -f "eudamed_trace_latest.metadata.json"
+          test -f "RELEASE_NOTES_EUDAMED_TRACE.md"
+
+          # Recreate latest so it is shown as the newest release in GitHub's release list.
+          # Keep --latest=false so GitHub's green repository Latest marker is reserved for
+          # a future combined EUDAHUB platform release.
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag || true
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "$TITLE" \
+            --notes-file RELEASE_NOTES_EUDAMED_TRACE.md \
+            --latest=false
+
+          gh release upload "$TAG" \
+            eudamed_trace_latest.duckdb \
+            eudamed_trace_latest.metadata.json \
+            RELEASE_NOTES_EUDAMED_TRACE.md \
+            --repo "$REPO" \
+            --clobber
+
+      - name: Upload workflow debug artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eudamed-datalake-raw-${{ steps.mode.outputs.mode }}-${{ steps.timestamp.outputs.timestamp }}
+          path: |
+            *.metadata.json
+            RELEASE_NOTES_EUDAMED_DATALAKE_RAW.md
+            RELEASE_NOTES_EUDAMED_TRACE.md
+          retention-days: 7
