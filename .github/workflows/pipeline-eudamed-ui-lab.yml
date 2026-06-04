@@ -4,13 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Run mode"
+        description: "Fetch mode"
         required: false
         default: "incremental"
         type: choice
         options:
-          - incremental
-          - full
+          - "incremental"
+          - "full"
+      workers:
+        description: "Parallel workers"
+        required: false
+        default: "4"
+      max_rps:
+        description: "Max requests per second per client"
+        required: false
+        default: "1.0"
       skip_csv_zip:
         description: "Skip CSV ZIP export"
         required: false
@@ -20,58 +28,24 @@ on:
           - "false"
           - "true"
 
-  schedule:
-    - cron: "0 0,6,12,18 * * *"
-    - cron: "0 2 * * *"
-
 permissions:
   contents: write
 
 concurrency:
-  group: eudamed-platform-raw
+  group: eudamed-upstream
   cancel-in-progress: false
 
 env:
   DATA_REPO: Wakzi/EUDAHUB-Intelligence-Data
   OUT_DIR: dist/eudamed_platform_raw
-  INPUT_DIR: inputs
-  PY_FILE: pipelines/eudamed/pipeline_eudamed_platform_raw.py
-  LATEST_TAG: eudamed-platform-raw-latest
-  LEGACY_LATEST_TAG: eudamed-ui-lab-latest
 
 jobs:
   fetch-platform-raw:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set run metadata
-        id: meta
-        shell: bash
-        run: |
-          set -euo pipefail
-          TS="$(date -u +'%Y%m%d_%H%M%S')"
-          echo "release_ts=$TS" >> "$GITHUB_OUTPUT"
-
-          MODE="${{ github.event.inputs.mode || '' }}"
-          if [ -z "$MODE" ]; then
-            HOUR="$(date -u +'%H')"
-            if [ "$HOUR" = "02" ]; then
-              MODE="full"
-            else
-              MODE="incremental"
-            fi
-          fi
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-
-          SKIP_CSV="${{ github.event.inputs.skip_csv_zip || 'false' }}"
-          echo "skip_csv_zip=$SKIP_CSV" >> "$GITHUB_OUTPUT"
-
-          echo "release_ts=$TS"
-          echo "mode=$MODE"
-          echo "skip_csv_zip=$SKIP_CSV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -79,154 +53,118 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install duckdb pandas requests
 
-      - name: Prepare folders
-        shell: bash
+      - name: Generate UTC timestamp
+        id: timestamp
         run: |
-          mkdir -p "$OUT_DIR" "$INPUT_DIR"
+          echo "timestamp=$(date -u +'%Y%m%d_%H%M%S')" >> "$GITHUB_OUTPUT"
+          echo "timestamp_human=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
 
-      - name: Download previous Platform Raw assets
-        shell: bash
-        continue-on-error: true
+      - name: Prepare inputs
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
           set +e
-          gh release download "$LATEST_TAG" \
+          mkdir -p inputs
+
+          gh release download "eudamed-platform-raw-latest" \
             --repo "$DATA_REPO" \
             --pattern "eudamed_platform_raw.duckdb" \
-            --dir "$INPUT_DIR" \
-            --clobber
-          gh release download "$LATEST_TAG" \
+            --dir inputs \
+            --clobber || true
+
+          gh release download "eudamed-platform-raw-latest" \
             --repo "$DATA_REPO" \
             --pattern "eudamed_platform_raw_state.json" \
-            --dir "$INPUT_DIR" \
-            --clobber
-          ls -lh "$INPUT_DIR" || true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            --dir inputs \
+            --clobber || true
 
-      - name: Download legacy UI Lab assets for first-run migration
-        shell: bash
-        continue-on-error: true
-        run: |
-          set +e
-          gh release download "$LEGACY_LATEST_TAG" \
+          gh release download "eudamed-ui-lab-latest" \
             --repo "$DATA_REPO" \
-            --pattern "eudamed_ui_lab.duckdb.zip" \
-            --dir "$INPUT_DIR" \
-            --clobber
-          gh release download "$LEGACY_LATEST_TAG" \
-            --repo "$DATA_REPO" \
-            --pattern "eudamed_ui_lab_v4_6.duckdb.zip" \
-            --dir "$INPUT_DIR" \
-            --clobber
-          gh release download "$LEGACY_LATEST_TAG" \
-            --repo "$DATA_REPO" \
-            --pattern "ui_api_state_v4_6.json" \
-            --dir "$INPUT_DIR" \
-            --clobber
-          gh release download "$LEGACY_LATEST_TAG" \
-            --repo "$DATA_REPO" \
-            --pattern "ui_api_state.json" \
-            --dir "$INPUT_DIR" \
-            --clobber
-          ls -lh "$INPUT_DIR" || true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            --pattern "eudamed_ui_lab.duckdb" \
+            --dir inputs \
+            --clobber || true
 
-      - name: Run EUDAMED Platform Raw acquisition
-        shell: bash
+          gh release download "eudamed-ui-lab-latest" \
+            --repo "$DATA_REPO" \
+            --pattern "ui_api_state*.json" \
+            --dir inputs \
+            --clobber || true
+
+          ls -lh inputs || true
+
+      - name: Run Platform Raw
         run: |
-          set -euo pipefail
-          ARGS=(
-            --mode "${{ steps.meta.outputs.mode }}"
-            --out-dir "$OUT_DIR"
-            --inputs-dir "$INPUT_DIR"
-            --page-size 300
-            --workers 12
-            --max-rps 3.0
-            --retries 4
-            --backoff 1.5
-            --discovery-retries 8
-            --discovery-retry-pause 30
-            --release-timestamp "${{ steps.meta.outputs.release_ts }}"
-          )
-          if [ "${{ steps.meta.outputs.skip_csv_zip }}" = "true" ]; then
-            ARGS+=(--skip-csv-zip)
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.skip_csv_zip || 'false' }}" = "true" ]; then
+            EXTRA_ARGS="--skip-csv-zip"
           fi
-          python "$PY_FILE" "${ARGS[@]}"
 
-      - name: Verify outputs
-        shell: bash
+          python -u pipelines/eudamed/pipeline_eudamed_platform_raw.py \
+            --mode "${{ github.event.inputs.mode || 'incremental' }}" \
+            --out-dir "$OUT_DIR" \
+            --inputs-dir inputs \
+            --release-timestamp "${{ steps.timestamp.outputs.timestamp }}" \
+            --workers "${{ github.event.inputs.workers || '4' }}" \
+            --max-rps "${{ github.event.inputs.max_rps || '1.0' }}" \
+            $EXTRA_ARGS
+
+      - name: List output
         run: |
-          set -euo pipefail
-          test -s "$OUT_DIR/eudamed_platform_raw.duckdb"
-          test -s "$OUT_DIR/eudamed_platform_raw_state.json"
-          test -s "$OUT_DIR/eudamed_platform_raw_stats.json"
-          test -s "$OUT_DIR/release_notes.md"
-          if [ "${{ steps.meta.outputs.skip_csv_zip }}" != "true" ]; then
-            test -s "$OUT_DIR/eudamed_platform_raw.csv.zip"
-          fi
-          ls -lh "$OUT_DIR"
+          find "$OUT_DIR" -maxdepth 1 -type f -print -exec ls -lh {} \;
 
-      - name: Create dated release first
-        shell: bash
-        run: |
-          set -euo pipefail
-          TS="${{ steps.meta.outputs.release_ts }}"
-          gh release create "$TS" \
-            --repo "$DATA_REPO" \
-            --title "$TS" \
-            --notes-file "$OUT_DIR/release_notes_${TS}.md"
-
-          gh release upload "$TS" \
-            "$OUT_DIR/eudamed_platform_raw_${TS}.duckdb" \
-            "$OUT_DIR/eudamed_platform_raw_state_${TS}.json" \
-            "$OUT_DIR/eudamed_platform_raw_stats_${TS}.json" \
-            "$OUT_DIR/release_notes_${TS}.md" \
-            --repo "$DATA_REPO" \
-            --clobber
-
-          if [ -s "$OUT_DIR/eudamed_platform_raw_${TS}.csv.zip" ]; then
-            gh release upload "$TS" \
-              "$OUT_DIR/eudamed_platform_raw_${TS}.csv.zip" \
-              --repo "$DATA_REPO" \
-              --clobber
-          fi
+      - name: Create latest release in Data repo
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Recreate latest release
-        shell: bash
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
         run: |
-          set -euo pipefail
-          gh release delete "$LATEST_TAG" \
-            --repo "$DATA_REPO" \
-            --yes || true
+          TAG="eudamed-platform-raw-latest"
+          REPO="$DATA_REPO"
 
-          git push --delete "https://x-access-token:${GH_TOKEN}@github.com/${DATA_REPO}.git" "$LATEST_TAG" || true
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag || true
 
-          gh release create "$LATEST_TAG" \
-            --repo "$DATA_REPO" \
+          gh release create "$TAG" \
+            --repo "$REPO" \
             --title "EUDAMED Platform Raw Latest" \
-            --notes-file "$OUT_DIR/release_notes.md"
+            --notes-file "$OUT_DIR/release_notes.md" \
+            --latest=false
 
-          gh release upload "$LATEST_TAG" \
+          gh release upload "$TAG" \
             "$OUT_DIR/eudamed_platform_raw.duckdb" \
             "$OUT_DIR/eudamed_platform_raw_state.json" \
             "$OUT_DIR/eudamed_platform_raw_stats.json" \
             "$OUT_DIR/release_notes.md" \
-            --repo "$DATA_REPO" \
+            --repo "$REPO" \
             --clobber
 
-          if [ -s "$OUT_DIR/eudamed_platform_raw.csv.zip" ]; then
-            gh release upload "$LATEST_TAG" \
-              "$OUT_DIR/eudamed_platform_raw.csv.zip" \
-              --repo "$DATA_REPO" \
-              --clobber
+          if [ -f "$OUT_DIR/eudamed_platform_raw.csv.zip" ]; then
+            gh release upload "$TAG" "$OUT_DIR/eudamed_platform_raw.csv.zip" --repo "$REPO" --clobber
           fi
+
+      - name: Create dated release in Data repo
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          TAG="eudamed-platform-raw-${TS}"
+          REPO="$DATA_REPO"
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "EUDAMED Platform Raw - ${{ steps.timestamp.outputs.timestamp_human }}" \
+            --notes-file "$OUT_DIR/release_notes_${TS}.md" \
+            --latest=false
+
+          gh release upload "$TAG" \
+            "$OUT_DIR/eudamed_platform_raw_${TS}.duckdb" \
+            "$OUT_DIR/eudamed_platform_raw_state_${TS}.json" \
+            "$OUT_DIR/eudamed_platform_raw_stats_${TS}.json" \
+            "$OUT_DIR/release_notes_${TS}.md" \
+            --repo "$REPO" \
+            --clobber
+
+          if [ -f "$OUT_DIR/eudamed_platform_raw_${TS}.csv.zip" ]; then
+            gh release upload "$TAG" "$OUT_DIR/eudamed_platform_raw_${TS}.csv.zip" --repo "$REPO" --clobber
+          fi
