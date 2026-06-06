@@ -1,0 +1,168 @@
+name: Pipeline EUDAMED Platform UDI Raw
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Fetch mode"
+        required: false
+        default: "incremental"
+        type: choice
+        options:
+          - incremental
+          - full
+      max_rps:
+        description: "Max requests per second"
+        required: false
+        default: "1.0"
+      max_pages:
+        description: "Optional page cap for testing. 0 = no cap"
+        required: false
+        default: "0"
+      skip_csv_zip:
+        description: "Skip CSV ZIP export"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eudamed-platform-udi-raw
+  cancel-in-progress: false
+
+env:
+  DATA_REPO: Wakzi/EUDAHUB-Intelligence-Data
+  OUT_DIR: dist/eudamed_platform_udi_raw
+
+jobs:
+  fetch-platform-raw:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install duckdb pandas requests
+
+      - name: Generate UTC timestamp
+        id: timestamp
+        run: |
+          echo "timestamp=$(date -u +'%Y%m%d_%H%M%S')" >> "$GITHUB_OUTPUT"
+          echo "timestamp_human=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare previous latest input
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          set +e
+          mkdir -p inputs
+
+          gh release download "eudamed-platform-udi-raw-latest" \
+            --repo "$DATA_REPO" \
+            --pattern "eudamed_platform_udi_raw_latest.duckdb" \
+            --dir inputs \
+            --clobber || true
+
+          gh release download "eudamed-platform-udi-raw-latest" \
+            --repo "$DATA_REPO" \
+            --pattern "eudamed_platform_udi_raw_latest.metadata.json" \
+            --dir inputs \
+            --clobber || true
+
+          ls -lh inputs || true
+
+      - name: Run Platform Raw
+        run: |
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.skip_csv_zip || 'false' }}" = "true" ]; then
+            EXTRA_ARGS="--skip-csv-zip"
+          fi
+
+          python -u pipelines/eudamed/pipeline_eudamed_platform_udi_raw.py \
+            --mode "${{ github.event.inputs.mode || 'incremental' }}" \
+            --out-dir "$OUT_DIR" \
+            --inputs-dir inputs \
+            --release-timestamp "${{ steps.timestamp.outputs.timestamp }}" \
+            --max-rps "${{ github.event.inputs.max_rps || '1.0' }}" \
+            --max-pages "${{ github.event.inputs.max_pages || '0' }}" \
+            $EXTRA_ARGS
+
+      - name: List output
+        run: |
+          find "$OUT_DIR" -maxdepth 1 -type f -print -exec ls -lh {} \;
+
+      - name: Validate output files
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          test -f "$OUT_DIR/eudamed_platform_udi_raw_latest.duckdb"
+          test -f "$OUT_DIR/eudamed_platform_udi_raw_latest.metadata.json"
+          test -f "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_UDI_RAW.md"
+          test -f "$OUT_DIR/eudamed_platform_udi_raw_${TS}.duckdb"
+          test -f "$OUT_DIR/eudamed_platform_udi_raw_${TS}.metadata.json"
+          test -f "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_UDI_RAW_${TS}.md"
+
+      - name: Create dated release in Data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          TAG="eudamed-platform-udi-raw-${TS}"
+          TITLE="EUDAMED Platform UDI Raw - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$DATA_REPO"
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "$TITLE" \
+            --notes-file "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_UDI_RAW_${TS}.md" \
+            --latest=false
+
+          gh release upload "$TAG" \
+            "$OUT_DIR/eudamed_platform_udi_raw_${TS}.duckdb" \
+            "$OUT_DIR/eudamed_platform_udi_raw_${TS}.metadata.json" \
+            "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_UDI_RAW_${TS}.md" \
+            --repo "$REPO" \
+            --clobber
+
+          if [ -f "$OUT_DIR/eudamed_platform_udi_raw_${TS}_csv.zip" ]; then
+            gh release upload "$TAG" "$OUT_DIR/eudamed_platform_udi_raw_${TS}_csv.zip" --repo "$REPO" --clobber
+          fi
+
+      - name: Create latest release in Data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TAG="eudamed-platform-udi-raw-latest"
+          TITLE="Latest EUDAMED Platform UDI Raw - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$DATA_REPO"
+
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag || true
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "$TITLE" \
+            --notes-file "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_UDI_RAW.md" \
+            --latest=false
+
+          gh release upload "$TAG" \
+            "$OUT_DIR/eudamed_platform_udi_raw_latest.duckdb" \
+            "$OUT_DIR/eudamed_platform_udi_raw_latest.metadata.json" \
+            "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_UDI_RAW.md" \
+            --repo "$REPO" \
+            --clobber
+
+          if [ -f "$OUT_DIR/eudamed_platform_udi_raw_latest_csv.zip" ]; then
+            gh release upload "$TAG" "$OUT_DIR/eudamed_platform_udi_raw_latest_csv.zip" --repo "$REPO" --clobber
+          fi
