@@ -3,7 +3,7 @@
 """
 EUDAMED Platform UDI Raw acquisition pipeline.
 
-Pipeline version: v4.8.1
+Pipeline version: v5.0
 
 Scope
 -----
@@ -14,13 +14,13 @@ Scope
 Design
 ------
 - Default mode is incremental.
-- Manual mode can be incremental or full.
+- Manual mode can be incremental, full, or resume_full.
 - page=0 is the initial data page and also contains all metadata needed
   (totalElements, totalPages, page size, first/last flags).
 - Previous latest is optional. If incremental is requested and no previous DB
   exists, the run becomes BOOTSTRAP and performs a full crawl.
 - COMPLETE, PARTIAL, BOOTSTRAP publish a merged latest.
-- FAILED means zero usable rows were received and latest should not be updated.
+- FAILED means zero usable API pages/rows were received and latest should not be updated.
 - Partial runs never delete or shrink latest: they merge received rows into the
   previous latest by UUID and retain unseen previous rows.
 
@@ -60,7 +60,7 @@ import duckdb
 import pandas as pd
 import requests
 
-PIPELINE_VERSION = "v4.8.1"
+PIPELINE_VERSION = "v4.8.2"
 BASE_URL_DEFAULT = "https://ec.europa.eu/tools/eudamed/api"
 UDI_ENDPOINT = "/devices/udiDiData"
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -263,7 +263,6 @@ class EudamedClient:
             "Cache-Control": "no-cache",
         })
         self._last_request_at = 0.0
-        self.throttle_events: List[Dict[str, Any]] = []
         self.throttle_events: List[Dict[str, Any]] = []
 
     def _rate_limit(self) -> None:
@@ -527,94 +526,273 @@ def page_audit_row(page: int, status: int, data: Optional[Dict[str, Any]], rows:
     }
 
 
-def fetch_incremental(client: EudamedClient, initial_data: Dict[str, Any], initial_meta: Dict[str, Any], known_max_ulid: str, extract_date: str, extract_ts: str, known_pages_to_stop: int, extra_pages_after_match: int, max_pages: int = 0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], bool]:
+
+def make_phase_stats(name: str) -> Dict[str, Any]:
+    return {
+        "phase": name,
+        "pages_fetched": 0,
+        "rows_received": 0,
+        "new_uuid_count": 0,
+        "refreshed_uuid_count": 0,
+        "known_pages_streak_at_stop": 0,
+        "stop_reason": None,
+        "start_page": None,
+        "last_successful_page": None,
+        "next_page_to_fetch": None,
+    }
+
+
+def progress_values(pages_done: int, pages_total: int, rows: int, started_at: float, response_times_ms: List[float], status_counts: Dict[int, int], throttle_count: int) -> Dict[str, Any]:
+    elapsed = max(0.001, time.monotonic() - started_at)
+    rate = pages_done / elapsed if pages_done else 0.0
+    remaining_pages = max(0, pages_total - pages_done)
+    eta = remaining_pages / rate if rate > 0 else None
+    avg_ms = sum(response_times_ms) / len(response_times_ms) if response_times_ms else 0.0
+    failed = sum(v for k, v in status_counts.items() if k != 200)
+    pct = (pages_done / pages_total * 100.0) if pages_total else 0.0
+    return {
+        "elapsed_seconds": elapsed,
+        "pages_per_second": rate,
+        "remaining_pages": remaining_pages,
+        "eta_seconds": eta,
+        "avg_response_ms": avg_ms,
+        "failed_count": failed,
+        "pct": pct,
+        "rows": rows,
+        "throttle_429_count": throttle_count,
+    }
+
+
+def phase_log_line(phase: str, page: int, total_pages: int, rows_n: int, new_n: int, refreshed_n: int, known_streak: Optional[int], known_stop: Optional[int], status: int, elapsed_ms: Optional[float], retry_after: Optional[str], received_rows: int, pages_done: int, pages_total_for_progress: int, started_at: float, response_times_ms: List[float], status_counts: Dict[int, int], throttle_count: int, stop_reason: Optional[str] = None) -> str:
+    pv = progress_values(pages_done, pages_total_for_progress, received_rows, started_at, response_times_ms, status_counts, throttle_count)
+    known_part = ""
+    if known_streak is not None and known_stop is not None:
+        known_part = f" | known_streak={known_streak}/{known_stop}"
+    reason_part = f" | reason={stop_reason}" if stop_reason else ""
+    return (
+        f"{phase} page={page}/{max(0, total_pages-1)} | rows={rows_n} | new={new_n} | refreshed={refreshed_n}"
+        f"{known_part} | status={status} | elapsed_ms={(elapsed_ms or 0):.0f} | retry_after={retry_after} | "
+        f"received_rows={received_rows:,} | rate={pv['pages_per_second']:.3f} pages/s | "
+        f"avg_response={pv['avg_response_ms']:.0f} ms | 429_count={throttle_count} | failed_count={pv['failed_count']} | "
+        f"elapsed={fmt_duration(pv['elapsed_seconds'])} | ETA={fmt_duration(pv['eta_seconds'])}{reason_part}"
+    )
+
+
+def runtime_exceeded(started_at: float, max_runtime_hours: float) -> bool:
+    return bool(max_runtime_hours and max_runtime_hours > 0 and ((time.monotonic() - started_at) / 3600.0) >= max_runtime_hours)
+
+
+def count_new_and_refreshed(rows: List[Dict[str, Any]], existing_uuid_set: set) -> Tuple[int, int]:
+    uuids = {r.get("uuid") for r in rows if r.get("uuid")}
+    new_n = len(uuids - existing_uuid_set)
+    refreshed_n = len(uuids & existing_uuid_set)
+    return new_n, refreshed_n
+
+
+def fetch_page_and_record(
+    client: EudamedClient,
+    page: int,
+    extract_date: str,
+    extract_ts: str,
+    page_audit: List[Dict[str, Any]],
+    request_log: List[Dict[str, Any]],
+    response_times_ms: List[float],
+    status_counts: Dict[int, int],
+    initial_data: Optional[Dict[str, Any]] = None,
+    initial_meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, int, Optional[Dict[str, Any]], List[Dict[str, Any]], Optional[float], Optional[str], Optional[str]]:
+    if initial_data is not None:
+        status, data, error, elapsed_ms, retry_after = 200, initial_data, None, (initial_meta or {}).get("elapsed_ms"), (initial_meta or {}).get("retry_after")
+        initial = True
+    else:
+        _, status, data, error, elapsed_ms, retry_after = client.fetch_page(page)
+        initial = False
+    rows = parse_page(data, page, extract_date, extract_ts) if data else []
+    status_counts[int(status or 0)] = status_counts.get(int(status or 0), 0) + 1
+    if elapsed_ms is not None:
+        response_times_ms.append(float(elapsed_ms))
+    page_audit.append(page_audit_row(page, status, data, rows, elapsed_ms, error, initial_page=initial))
+    request_log.append(request_log_row(page, status, elapsed_ms, retry_after, error, initial_page=initial))
+    return status == 200, status, data, rows, elapsed_ms, retry_after, error
+
+
+def run_known_pages_scan(
+    client: EudamedClient,
+    phase_name: str,
+    direction: str,
+    start_page: int,
+    total_pages: int,
+    extract_date: str,
+    extract_ts: str,
+    existing_uuid_set: set,
+    known_pages_to_stop: int,
+    max_pages: int,
+    started_at: float,
+    response_times_ms: List[float],
+    status_counts: Dict[int, int],
+    page_audit: List[Dict[str, Any]],
+    request_log: List[Dict[str, Any]],
+    received_rows: List[Dict[str, Any]],
+    fetched_pages: set,
+    initial_data: Optional[Dict[str, Any]] = None,
+    initial_meta: Optional[Dict[str, Any]] = None,
+    max_runtime_hours: float = 0.0,
+    log_every_page: bool = True,
+) -> Tuple[Dict[str, Any], bool]:
+    stats = make_phase_stats(phase_name)
+    stats["start_page"] = start_page
+    consecutive_known = 0
+    pages_done_phase = 0
+    normal_completion = False
+    page = start_page
+    step = 1 if direction == "forward" else -1
+    log(f"=== {phase_name} {direction} start_page={start_page} known_pages_to_stop={known_pages_to_stop} ===")
+
+    while 0 <= page < total_pages:
+        if max_pages and pages_done_phase >= max_pages:
+            stats["stop_reason"] = "max_pages_cap_reached"
+            normal_completion = True
+            break
+        if runtime_exceeded(started_at, max_runtime_hours):
+            stats["stop_reason"] = "runtime_limit"
+            normal_completion = False
+            break
+        if page in fetched_pages:
+            page += step
+            continue
+        use_initial = initial_data is not None and page == 0
+        ok, status, data, rows, elapsed_ms, retry_after, error = fetch_page_and_record(
+            client, page, extract_date, extract_ts, page_audit, request_log, response_times_ms, status_counts,
+            initial_data=initial_data if use_initial else None,
+            initial_meta=initial_meta if use_initial else None,
+        )
+        fetched_pages.add(page)
+        pages_done_phase += 1
+        stats["pages_fetched"] += 1
+        if ok:
+            received_rows.extend(rows)
+            stats["rows_received"] += len(rows)
+            stats["last_successful_page"] = page
+            stats["next_page_to_fetch"] = page + step
+        else:
+            stats["stop_reason"] = f"page_{page}_fetch_failed"
+            normal_completion = False
+            log(phase_log_line(phase_name, page, total_pages, len(rows), 0, 0, consecutive_known, known_pages_to_stop, status, elapsed_ms, retry_after, len(received_rows), len(page_audit), total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), stats["stop_reason"]))
+            break
+        new_n, refreshed_n = count_new_and_refreshed(rows, existing_uuid_set)
+        stats["new_uuid_count"] += new_n
+        stats["refreshed_uuid_count"] += refreshed_n
+        consecutive_known = consecutive_known + 1 if new_n == 0 else 0
+        stats["known_pages_streak_at_stop"] = consecutive_known
+        if log_every_page:
+            log(phase_log_line(phase_name, page, total_pages, len(rows), new_n, refreshed_n, consecutive_known, known_pages_to_stop, status, elapsed_ms, retry_after, len(received_rows), len(page_audit), total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events)))
+        if len(rows) == 0:
+            stats["stop_reason"] = "empty_page"
+            normal_completion = True
+            break
+        if consecutive_known >= known_pages_to_stop:
+            stats["stop_reason"] = f"{known_pages_to_stop}_known_pages_in_a_row"
+            normal_completion = True
+            break
+        page += step
+    else:
+        stats["stop_reason"] = "boundary_reached"
+        normal_completion = True
+
+    if stats["stop_reason"] is None:
+        stats["stop_reason"] = "loop_complete"
+    return stats, normal_completion
+
+
+def fetch_incremental(
+    client: EudamedClient,
+    initial_data: Dict[str, Any],
+    initial_meta: Dict[str, Any],
+    existing_uuid_set: set,
+    extract_date: str,
+    extract_ts: str,
+    head_known_pages_to_stop: int,
+    tail_known_pages_to_stop: int,
+    max_pages: int = 0,
+    max_runtime_hours: float = 0.0,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], bool]:
     total_pages = int(initial_meta.get("total_pages") or 0)
-    if max_pages and max_pages > 0:
-        total_pages = min(total_pages, max_pages)
     received_rows: List[Dict[str, Any]] = []
     page_audit: List[Dict[str, Any]] = []
     request_log: List[Dict[str, Any]] = []
-    frontier_reached = False
-    consecutive_known_only = 0
-    known_or_mixed_pages_seen = 0
-    normal_completion = False
-    stop_reason = None
     started_at = time.monotonic()
     response_times_ms: List[float] = []
     status_counts: Dict[int, int] = {}
-    detailed_logging = False
-    detailed_logging_reason = None
+    fetched_pages: set = set()
 
-    log(f"=== Incremental from known max_ulid={known_max_ulid} ({decode_ulid(known_max_ulid)}) ===")
+    log("=== Incremental mode: HEAD + TAIL ===")
+    head_stats, head_ok = run_known_pages_scan(
+        client=client,
+        phase_name="Incremental Head",
+        direction="forward",
+        start_page=0,
+        total_pages=total_pages,
+        extract_date=extract_date,
+        extract_ts=extract_ts,
+        existing_uuid_set=existing_uuid_set,
+        known_pages_to_stop=head_known_pages_to_stop,
+        max_pages=max_pages if max_pages and max_pages > 0 else 0,
+        started_at=started_at,
+        response_times_ms=response_times_ms,
+        status_counts=status_counts,
+        page_audit=page_audit,
+        request_log=request_log,
+        received_rows=received_rows,
+        fetched_pages=fetched_pages,
+        initial_data=initial_data,
+        initial_meta=initial_meta,
+        max_runtime_hours=max_runtime_hours,
+        log_every_page=True,
+    )
 
-    def process_page(page: int, data: Optional[Dict[str, Any]] = None, initial: bool = False) -> Tuple[bool, int, int, int, Optional[float], Optional[str], Optional[str], int]:
-        if data is None:
-            _, status, data, error, elapsed_ms, retry_after = client.fetch_page(page)
-        else:
-            status, error, elapsed_ms, retry_after = 200, None, initial_meta.get("elapsed_ms"), initial_meta.get("retry_after")
-        rows = parse_page(data, page, extract_date, extract_ts) if data else []
-        status_counts[int(status or 0)] = status_counts.get(int(status or 0), 0) + 1
-        if elapsed_ms is not None:
-            response_times_ms.append(float(elapsed_ms))
-        new_candidates = [r for r in rows if (str(r.get("ulid") or "") > str(known_max_ulid or ""))]
-        received_rows.extend(new_candidates)
-        page_audit.append(page_audit_row(page, status, data, rows, elapsed_ms, error, initial_page=initial))
-        request_log.append(request_log_row(page, status, elapsed_ms, retry_after, error, initial_page=initial))
-        ok = status == 200
-        return ok, len(rows), len(new_candidates), len(rows) - len(new_candidates), elapsed_ms, retry_after, error, status
-
-    page = 0
-    while page < total_pages:
-        throttles_before = len(client.throttle_events)
-        ok, rows_n, new_n, known_n, elapsed_ms, retry_after, error, status = process_page(page, data=initial_data if page == 0 else None, initial=(page == 0))
-        if len(client.throttle_events) > throttles_before:
-            detailed_logging = True
-            detailed_logging_reason = detailed_logging_reason or f"429 observed around page={page}"
-        if not ok:
-            stop_reason = f"page_{page}_fetch_failed"
-            break
-        if detailed_logging:
-            log(
-                f"Incremental detail page={page}/{total_pages-1} | rows={rows_n} | new={new_n} | known_or_old={known_n} | "
-                f"status={status} | elapsed_ms={(elapsed_ms or 0):.0f} | retry_after={retry_after} | "
-                f"429_count={len(client.throttle_events)} | reason={detailed_logging_reason}"
-            )
-            log(build_progress("Incremental", len(page_audit), total_pages, len(received_rows), started_at, response_times_ms, status_counts, len(client.throttle_events)))
-        else:
-            log(f"Incremental page={page} rows={rows_n} new={new_n} added={new_n} known_or_old={known_n}")
-        if rows_n == 0:
-            stop_reason = "empty_page"
-            break
-        if known_n > 0:
-            frontier_reached = True
-            known_or_mixed_pages_seen += 1
-        consecutive_known_only = consecutive_known_only + 1 if new_n == 0 else 0
-        if frontier_reached and consecutive_known_only >= known_pages_to_stop + extra_pages_after_match:
-            stop_reason = "frontier_reached_extra_known_pages_exhausted"
-            normal_completion = True
-            break
-        page += 1
+    tail_ok = True
+    tail_stats = make_phase_stats("Incremental Tail")
+    if head_ok and not runtime_exceeded(started_at, max_runtime_hours):
+        tail_stats, tail_ok = run_known_pages_scan(
+            client=client,
+            phase_name="Incremental Tail",
+            direction="backward",
+            start_page=max(0, total_pages - 1),
+            total_pages=total_pages,
+            extract_date=extract_date,
+            extract_ts=extract_ts,
+            existing_uuid_set=existing_uuid_set,
+            known_pages_to_stop=tail_known_pages_to_stop,
+            max_pages=0,
+            started_at=started_at,
+            response_times_ms=response_times_ms,
+            status_counts=status_counts,
+            page_audit=page_audit,
+            request_log=request_log,
+            received_rows=received_rows,
+            fetched_pages=fetched_pages,
+            max_runtime_hours=max_runtime_hours,
+            log_every_page=True,
+        )
+    elif runtime_exceeded(started_at, max_runtime_hours):
+        tail_ok = False
+        tail_stats["stop_reason"] = "skipped_runtime_limit"
     else:
-        stop_reason = "all_pages_scanned"
-        normal_completion = True
+        tail_ok = False
+        tail_stats["stop_reason"] = "skipped_head_failed"
 
     elapsed_total = time.monotonic() - started_at
     pages_ok = len([r for r in page_audit if r.get("ok")])
+    normal_completion = bool(head_ok and tail_ok)
     audit = {
         "mode": "incremental",
-        "known_max_ulid_before": known_max_ulid,
-        "known_max_ulid_before_timestamp": decode_ulid(known_max_ulid),
         "api_total_elements": initial_meta.get("total_elements"),
         "api_total_pages": initial_meta.get("total_pages"),
         "pages_fetched": pages_ok,
-        "new_rows_received": len(received_rows),
-        "frontier_reached": frontier_reached,
-        "known_or_mixed_pages_seen": known_or_mixed_pages_seen,
-        "consecutive_known_only_pages_at_stop": consecutive_known_only,
-        "known_pages_to_stop": known_pages_to_stop,
-        "extra_pages_after_match": extra_pages_after_match,
-        "stop_reason": stop_reason,
+        "received_rows": len(received_rows),
         "normal_completion": normal_completion,
+        "stop_reason": "incremental_head_tail_complete" if normal_completion else "incremental_partial",
+        "phases": {"head": head_stats, "tail": tail_stats},
         "telemetry": {
             "elapsed_seconds": elapsed_total,
             "pages_per_second": pages_ok / max(0.001, elapsed_total),
@@ -622,14 +800,21 @@ def fetch_incremental(client: EudamedClient, initial_data: Dict[str, Any], initi
             "status_counts": {str(k): v for k, v in sorted(status_counts.items())},
             "throttle_429_count": len(client.throttle_events),
             "throttle_events": client.throttle_events,
-            "detailed_logging_enabled": detailed_logging,
-            "detailed_logging_reason": detailed_logging_reason,
         },
     }
     return received_rows, page_audit, request_log, audit, normal_completion
 
 
-def fetch_full(client: EudamedClient, initial_data: Dict[str, Any], initial_meta: Dict[str, Any], extract_date: str, extract_ts: str, max_pages: int = 0) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], bool]:
+def fetch_full(
+    client: EudamedClient,
+    initial_data: Dict[str, Any],
+    initial_meta: Dict[str, Any],
+    extract_date: str,
+    extract_ts: str,
+    max_pages: int = 0,
+    max_429_before_partial: int = 7,
+    max_runtime_hours: float = 0.0,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], bool]:
     total_pages = int(initial_meta.get("total_pages") or 0)
     if max_pages and max_pages > 0:
         total_pages = min(total_pages, max_pages)
@@ -638,49 +823,43 @@ def fetch_full(client: EudamedClient, initial_data: Dict[str, Any], initial_meta
     request_log: List[Dict[str, Any]] = []
     failed_pages: List[int] = []
     normal_completion = True
+    stop_reason = "all_pages_fetched"
     started_at = time.monotonic()
     response_times_ms: List[float] = []
     status_counts: Dict[int, int] = {}
-    detailed_logging = False
-    detailed_logging_reason = None
     last_successful_page: Optional[int] = None
 
     log(f"=== Full fetch pages 0..{total_pages - 1} ({total_pages} pages) ===")
     for page in range(total_pages):
-        throttles_before = len(client.throttle_events)
-        if page == 0:
-            status, data, error, elapsed_ms, retry_after = 200, initial_data, None, initial_meta.get("elapsed_ms"), initial_meta.get("retry_after")
-        else:
-            _, status, data, error, elapsed_ms, retry_after = client.fetch_page(page)
-        rows = parse_page(data, page, extract_date, extract_ts) if data else []
-        status_counts[int(status or 0)] = status_counts.get(int(status or 0), 0) + 1
-        if elapsed_ms is not None:
-            response_times_ms.append(float(elapsed_ms))
-        if len(client.throttle_events) > throttles_before:
-            detailed_logging = True
-            detailed_logging_reason = detailed_logging_reason or f"429 observed around page={page}"
-        if status == 200:
+        ok, status, data, rows, elapsed_ms, retry_after, error = fetch_page_and_record(
+            client, page, extract_date, extract_ts, page_audit, request_log, response_times_ms, status_counts,
+            initial_data=initial_data if page == 0 else None,
+            initial_meta=initial_meta if page == 0 else None,
+        )
+        if ok:
             received_rows.extend(rows)
             last_successful_page = page
         else:
             failed_pages.append(page)
             normal_completion = False
-            log(f"WARNING full fetch stopped at page={page}; status={status}; error={error}; elapsed_ms={elapsed_ms}")
-            break
-        page_audit.append(page_audit_row(page, status, data, rows, elapsed_ms, error, initial_page=(page == 0)))
-        request_log.append(request_log_row(page, status, elapsed_ms, retry_after, error, initial_page=(page == 0)))
-
+            stop_reason = "page_fetch_failed"
         pages_done = page + 1
-        if detailed_logging:
-            log(
-                f"Full fetch detail page={page}/{total_pages-1} | rows={len(rows)} | status={status} | "
-                f"elapsed_ms={(elapsed_ms or 0):.0f} | retry_after={retry_after} | received_rows={len(received_rows):,} | "
-                f"429_count={len(client.throttle_events)} | reason={detailed_logging_reason}"
-            )
-            if page % 10 == 0 or page == total_pages - 1:
-                log(build_progress("Full fetch", pages_done, total_pages, len(received_rows), started_at, response_times_ms, status_counts, len(client.throttle_events)))
-        elif page % 50 == 0 or page == total_pages - 1:
-            log(build_progress("Full fetch", pages_done, total_pages, len(received_rows), started_at, response_times_ms, status_counts, len(client.throttle_events)))
+        detailed = len(client.throttle_events) > 0
+        should_log = detailed or page % 50 == 0 or page == total_pages - 1 or not ok
+        if should_log:
+            log(phase_log_line("Full", page, total_pages, len(rows), 0, len(rows), None, None, status, elapsed_ms, retry_after, len(received_rows), pages_done, total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), None if ok else stop_reason))
+        if not ok:
+            break
+        if max_429_before_partial and len(client.throttle_events) >= max_429_before_partial:
+            normal_completion = False
+            stop_reason = "429_limit"
+            log(f"FULL CONTROLLED PARTIAL STOP: 429_count={len(client.throttle_events)} max_429_before_partial={max_429_before_partial} last_successful_page={last_successful_page}")
+            break
+        if runtime_exceeded(started_at, max_runtime_hours):
+            normal_completion = False
+            stop_reason = "runtime_limit"
+            log(f"FULL CONTROLLED PARTIAL STOP: runtime_limit max_runtime_hours={max_runtime_hours} last_successful_page={last_successful_page}")
+            break
 
     elapsed_total = time.monotonic() - started_at
     pages_ok = len([r for r in page_audit if r.get("ok")])
@@ -693,9 +872,16 @@ def fetch_full(client: EudamedClient, initial_data: Dict[str, Any], initial_meta
         "failed_pages_count": len(failed_pages),
         "received_rows": len(received_rows),
         "normal_completion": normal_completion,
-        "stop_reason": "all_pages_fetched" if normal_completion else "page_fetch_failed",
+        "stop_reason": stop_reason,
         "last_successful_page": last_successful_page,
         "next_page_to_fetch": (last_successful_page + 1) if last_successful_page is not None else 0,
+        "resume_state": None if normal_completion else {
+            "resume_mode": "resume_full",
+            "last_successful_page": last_successful_page,
+            "next_page_to_fetch": (last_successful_page + 1) if last_successful_page is not None else 0,
+            "api_total_pages": initial_meta.get("total_pages"),
+            "stop_reason": stop_reason,
+        },
         "telemetry": {
             "elapsed_seconds": elapsed_total,
             "pages_per_second": pages_ok / max(0.001, elapsed_total),
@@ -703,12 +889,206 @@ def fetch_full(client: EudamedClient, initial_data: Dict[str, Any], initial_meta
             "status_counts": {str(k): v for k, v in sorted(status_counts.items())},
             "throttle_429_count": len(client.throttle_events),
             "throttle_events": client.throttle_events,
-            "detailed_logging_enabled": detailed_logging,
-            "detailed_logging_reason": detailed_logging_reason,
         },
     }
     return received_rows, page_audit, request_log, audit, normal_completion
 
+
+def read_previous_metadata(inputs_dir: Path) -> Dict[str, Any]:
+    path = inputs_dir / "eudamed_platform_udi_raw_latest.metadata.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log(f"WARNING could not read previous metadata {path}: {e}")
+        return {}
+
+
+def extract_resume_state(previous_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    if not previous_metadata:
+        return {}
+    audit = previous_metadata.get("audit") or {}
+    state = previous_metadata.get("resume_state") or audit.get("resume_state") or {}
+    if state:
+        return state
+    if audit.get("next_page_to_fetch") is not None:
+        return {
+            "resume_mode": "resume_full",
+            "last_successful_page": audit.get("last_successful_page"),
+            "next_page_to_fetch": audit.get("next_page_to_fetch"),
+            "api_total_pages": audit.get("api_total_pages") or previous_metadata.get("api_total_pages"),
+            "stop_reason": audit.get("stop_reason"),
+        }
+    return {}
+
+
+def fetch_resume_full(
+    client: EudamedClient,
+    initial_data: Dict[str, Any],
+    initial_meta: Dict[str, Any],
+    previous_metadata: Dict[str, Any],
+    existing_uuid_set: set,
+    extract_date: str,
+    extract_ts: str,
+    resume_overlap_pages: int,
+    head_known_pages_to_stop: int,
+    tail_known_pages_to_stop: int,
+    max_pages: int = 0,
+    max_429_before_partial: int = 7,
+    max_runtime_hours: float = 0.0,
+    slow_rps: float = 0.3,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], bool]:
+    total_pages = int(initial_meta.get("total_pages") or 0)
+    resume_state_in = extract_resume_state(previous_metadata)
+    next_page = int(resume_state_in.get("next_page_to_fetch") or 0)
+    body_start_page = max(0, next_page - max(0, resume_overlap_pages))
+    body_total_pages = total_pages
+    received_rows: List[Dict[str, Any]] = []
+    page_audit: List[Dict[str, Any]] = []
+    request_log: List[Dict[str, Any]] = []
+    failed_pages: List[int] = []
+    started_at = time.monotonic()
+    response_times_ms: List[float] = []
+    status_counts: Dict[int, int] = {}
+    fetched_pages: set = set()
+    last_successful_body_page: Optional[int] = None
+    normal_completion = False
+    stop_reason = "resume_body_complete"
+
+    log(f"=== Resume Full body start_page={body_start_page} next_page_from_state={next_page} overlap={resume_overlap_pages} ===")
+    page = body_start_page
+    body_pages_done = 0
+    while page < body_total_pages:
+        if max_pages and max_pages > 0 and body_pages_done >= max_pages:
+            stop_reason = "max_pages_cap_reached"
+            break
+        ok, status, data, rows, elapsed_ms, retry_after, error = fetch_page_and_record(
+            client, page, extract_date, extract_ts, page_audit, request_log, response_times_ms, status_counts,
+            initial_data=initial_data if page == 0 else None,
+            initial_meta=initial_meta if page == 0 else None,
+        )
+        fetched_pages.add(page)
+        body_pages_done += 1
+        new_n, refreshed_n = count_new_and_refreshed(rows, existing_uuid_set)
+        if ok:
+            received_rows.extend(rows)
+            last_successful_body_page = page
+        else:
+            failed_pages.append(page)
+            stop_reason = "page_fetch_failed"
+        log(phase_log_line("Resume Body", page, total_pages, len(rows), new_n, refreshed_n, None, None, status, elapsed_ms, retry_after, len(received_rows), len(page_audit), total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), None if ok else stop_reason))
+        if not ok:
+            break
+        if max_429_before_partial and len(client.throttle_events) >= max_429_before_partial:
+            stop_reason = "429_limit"
+            log(f"RESUME BODY CONTROLLED PARTIAL STOP: 429_count={len(client.throttle_events)} max_429_before_partial={max_429_before_partial} last_successful_body_page={last_successful_body_page}")
+            break
+        if runtime_exceeded(started_at, max_runtime_hours):
+            stop_reason = "runtime_limit"
+            log(f"RESUME BODY CONTROLLED PARTIAL STOP: runtime_limit max_runtime_hours={max_runtime_hours} last_successful_body_page={last_successful_body_page}")
+            break
+        page += 1
+    else:
+        normal_completion = True
+        stop_reason = "all_pages_fetched"
+
+    body_stats = {
+        "phase": "Resume Body",
+        "start_page": body_start_page,
+        "pages_fetched": body_pages_done,
+        "rows_received": sum(r.get("rows_returned") or 0 for r in page_audit if not r.get("initial_page") or True),
+        "last_successful_page": last_successful_body_page,
+        "next_page_to_fetch": (last_successful_body_page + 1) if last_successful_body_page is not None else body_start_page,
+        "stop_reason": stop_reason,
+    }
+
+    # After body, run slow head and tail incremental probes. They refresh rows but do not move body checkpoint.
+    old_rps = client.max_rps
+    if slow_rps and slow_rps > 0:
+        client.max_rps = slow_rps
+    head_stats, head_ok = run_known_pages_scan(
+        client=client,
+        phase_name="Resume Head",
+        direction="forward",
+        start_page=0,
+        total_pages=total_pages,
+        extract_date=extract_date,
+        extract_ts=extract_ts,
+        existing_uuid_set=existing_uuid_set,
+        known_pages_to_stop=head_known_pages_to_stop,
+        max_pages=0,
+        started_at=started_at,
+        response_times_ms=response_times_ms,
+        status_counts=status_counts,
+        page_audit=page_audit,
+        request_log=request_log,
+        received_rows=received_rows,
+        fetched_pages=fetched_pages,
+        initial_data=initial_data,
+        initial_meta=initial_meta,
+        max_runtime_hours=max_runtime_hours,
+        log_every_page=True,
+    )
+    tail_stats, tail_ok = run_known_pages_scan(
+        client=client,
+        phase_name="Resume Tail",
+        direction="backward",
+        start_page=max(0, total_pages - 1),
+        total_pages=total_pages,
+        extract_date=extract_date,
+        extract_ts=extract_ts,
+        existing_uuid_set=existing_uuid_set,
+        known_pages_to_stop=tail_known_pages_to_stop,
+        max_pages=0,
+        started_at=started_at,
+        response_times_ms=response_times_ms,
+        status_counts=status_counts,
+        page_audit=page_audit,
+        request_log=request_log,
+        received_rows=received_rows,
+        fetched_pages=fetched_pages,
+        max_runtime_hours=max_runtime_hours,
+        log_every_page=True,
+    )
+    client.max_rps = old_rps
+
+    elapsed_total = time.monotonic() - started_at
+    pages_ok = len([r for r in page_audit if r.get("ok")])
+    full_normal_completion = bool(normal_completion and head_ok and tail_ok)
+    resume_state_out = None if full_normal_completion else {
+        "resume_mode": "resume_full",
+        "last_successful_page": last_successful_body_page,
+        "next_page_to_fetch": (last_successful_body_page + 1) if last_successful_body_page is not None else body_start_page,
+        "api_total_pages": total_pages,
+        "resume_overlap_pages": resume_overlap_pages,
+        "recommended_resume_start_page": max(0, ((last_successful_body_page + 1) if last_successful_body_page is not None else body_start_page) - resume_overlap_pages),
+        "stop_reason": stop_reason,
+    }
+    audit = {
+        "mode": "resume_full",
+        "api_total_elements": initial_meta.get("total_elements"),
+        "api_total_pages": initial_meta.get("total_pages"),
+        "pages_fetched": pages_ok,
+        "failed_pages": failed_pages,
+        "failed_pages_count": len(failed_pages),
+        "received_rows": len(received_rows),
+        "normal_completion": full_normal_completion,
+        "stop_reason": "resume_full_complete" if full_normal_completion else stop_reason,
+        "last_successful_page": last_successful_body_page,
+        "next_page_to_fetch": (last_successful_body_page + 1) if last_successful_body_page is not None else body_start_page,
+        "resume_state": resume_state_out,
+        "phases": {"body": body_stats, "head": head_stats, "tail": tail_stats},
+        "telemetry": {
+            "elapsed_seconds": elapsed_total,
+            "pages_per_second": pages_ok / max(0.001, elapsed_total),
+            "avg_response_ms": (sum(response_times_ms) / len(response_times_ms)) if response_times_ms else None,
+            "status_counts": {str(k): v for k, v in sorted(status_counts.items())},
+            "throttle_429_count": len(client.throttle_events),
+            "throttle_events": client.throttle_events,
+        },
+    }
+    return received_rows, page_audit, request_log, audit, full_normal_completion
 
 def write_duckdb(out_db: Path, rows: List[Dict[str, Any]], initial_page: Dict[str, Any], page_audit: List[Dict[str, Any]], request_log: List[Dict[str, Any]], metadata: Dict[str, Any]) -> None:
     safe_unlink(out_db)
@@ -803,6 +1183,14 @@ def write_release_notes(path: Path, metadata: Dict[str, Any]) -> None:
         f"- Pages fetched: `{metadata.get('audit', {}).get('pages_fetched')}`",
         f"- Failed pages: `{metadata.get('audit', {}).get('failed_pages_count', 0)}`",
         "",
+        "## Phases",
+        "",
+        f"- Phase stats JSON: `{json.dumps(metadata.get('phases') or {}, ensure_ascii=False)}`",
+        "",
+        "## Resume state",
+        "",
+        f"- Resume state JSON: `{json.dumps(metadata.get('resume_state') or {}, ensure_ascii=False)}`",
+        "",
         "## Telemetry",
         "",
         f"- Pages/sec: `{(metadata.get('telemetry') or {}).get('pages_per_second')}`",
@@ -825,9 +1213,10 @@ def copy_file(src: Path, dst: Path) -> None:
     shutil.copy2(src, dst)
 
 
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["incremental", "full"], default="incremental")
+    p.add_argument("--mode", choices=["incremental", "full", "resume_full"], default="incremental")
     p.add_argument("--out-dir", default="dist/eudamed_platform_udi_raw")
     p.add_argument("--inputs-dir", default="inputs")
     p.add_argument("--base-url", default=BASE_URL_DEFAULT)
@@ -835,15 +1224,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--page-size", type=int, default=300)
     p.add_argument("--max-pages", type=int, default=0)
     p.add_argument("--max-rps", type=float, default=1.0)
+    p.add_argument("--slow-rps", type=float, default=0.3, help="Slow RPS used for resume_full head/tail refresh")
     p.add_argument("--timeout", type=int, default=60)
     p.add_argument("--retries", type=int, default=4)
     p.add_argument("--backoff", type=float, default=1.5)
-    p.add_argument("--known-pages-to-stop", type=int, default=5)
-    p.add_argument("--extra-pages-after-match", type=int, default=10)
+    p.add_argument("--head-known-pages-to-stop", type=int, default=20)
+    p.add_argument("--tail-known-pages-to-stop", type=int, default=20)
+    p.add_argument("--resume-overlap-pages", type=int, default=250)
+    p.add_argument("--max-429-before-partial", type=int, default=7)
+    p.add_argument("--max-runtime-hours", type=float, default=2.5)
     p.add_argument("--release-timestamp", default=None)
     p.add_argument("--skip-csv-zip", action="store_true")
     return p.parse_args(argv)
-
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
@@ -868,17 +1260,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         log("No previous Platform Raw latest DB found")
 
+    previous_metadata = read_previous_metadata(inputs_dir)
     previous_max_ulid = max_ulid(r.get("ulid") for r in existing_rows)
+    existing_uuid_set = {r.get("uuid") for r in existing_rows if r.get("uuid")}
     effective_mode = args.mode
     bootstrap = False
-    if args.mode == "incremental" and not existing_rows:
+    if args.mode in {"incremental", "resume_full"} and not existing_rows:
         effective_mode = "full"
         bootstrap = True
-        log("Incremental requested but no previous DB exists. Falling back to BOOTSTRAP full crawl.")
-    elif args.mode == "incremental" and not previous_max_ulid:
+        log(f"{args.mode} requested but no previous DB exists. Falling back to BOOTSTRAP full crawl.")
+    elif args.mode in {"incremental", "resume_full"} and not previous_max_ulid:
         effective_mode = "full"
         bootstrap = True
-        log("Incremental requested but previous DB has no max ULID. Falling back to BOOTSTRAP full crawl.")
+        log(f"{args.mode} requested but previous DB has no max ULID. Falling back to BOOTSTRAP full crawl.")
 
     client = EudamedClient(args.base_url, args.language, args.page_size, args.timeout, args.retries, args.backoff, args.max_rps)
 
@@ -910,12 +1304,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if effective_mode == "incremental":
         received_rows, page_audit, request_log, audit, normal_completion = fetch_incremental(
-            client, initial_data, initial_meta, str(previous_max_ulid), extract_date, extract_ts,
-            args.known_pages_to_stop, args.extra_pages_after_match, max_pages=args.max_pages
+            client, initial_data, initial_meta, existing_uuid_set, extract_date, extract_ts,
+            args.head_known_pages_to_stop, args.tail_known_pages_to_stop,
+            max_pages=args.max_pages, max_runtime_hours=args.max_runtime_hours
+        )
+    elif effective_mode == "resume_full":
+        received_rows, page_audit, request_log, audit, normal_completion = fetch_resume_full(
+            client, initial_data, initial_meta, previous_metadata, existing_uuid_set, extract_date, extract_ts,
+            resume_overlap_pages=args.resume_overlap_pages,
+            head_known_pages_to_stop=args.head_known_pages_to_stop,
+            tail_known_pages_to_stop=args.tail_known_pages_to_stop,
+            max_pages=args.max_pages,
+            max_429_before_partial=args.max_429_before_partial,
+            max_runtime_hours=args.max_runtime_hours,
+            slow_rps=args.slow_rps,
         )
     else:
         received_rows, page_audit, request_log, audit, normal_completion = fetch_full(
-            client, initial_data, initial_meta, extract_date, extract_ts, max_pages=args.max_pages
+            client, initial_data, initial_meta, extract_date, extract_ts,
+            max_pages=args.max_pages,
+            max_429_before_partial=args.max_429_before_partial,
+            max_runtime_hours=args.max_runtime_hours,
         )
 
     # A manual max_pages cap is a test/partial scope unless the cap is at or above the API total pages.
@@ -990,6 +1399,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "page_size": args.page_size,
         "max_pages": args.max_pages,
         "max_rps": args.max_rps,
+        "slow_rps": args.slow_rps,
+        "max_429_before_partial": args.max_429_before_partial,
+        "max_runtime_hours": args.max_runtime_hours,
+        "head_known_pages_to_stop": args.head_known_pages_to_stop,
+        "tail_known_pages_to_stop": args.tail_known_pages_to_stop,
+        "resume_overlap_pages": args.resume_overlap_pages,
         "retries": args.retries,
         "api_total_elements": api_total_elements,
         "api_total_pages": api_total_pages,
@@ -1005,6 +1420,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "normal_completion": normal_completion,
         "initial_page": initial_meta,
         "audit": audit,
+        "resume_state": (audit or {}).get("resume_state"),
+        "phases": (audit or {}).get("phases"),
         "merge": merge_stats,
         "request_status_summary": [{"endpoint": k[0], "status_code": k[1], "count": v} for k, v in sorted(status_summary.items())],
         "telemetry": (audit or {}).get("telemetry"),
@@ -1051,6 +1468,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "received_rows": len(received_rows),
         "previous_rows": len(existing_rows),
         "merge": merge_stats,
+        "phases": metadata.get("phases"),
+        "resume_state": metadata.get("resume_state"),
     }, ensure_ascii=False))
     return 0
 
