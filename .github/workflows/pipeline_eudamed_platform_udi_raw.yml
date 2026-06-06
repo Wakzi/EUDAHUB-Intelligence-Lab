@@ -11,6 +11,7 @@ on:
         options:
           - incremental
           - full
+          - resume_full
       max_rps:
         description: "Max requests per second"
         required: false
@@ -19,6 +20,30 @@ on:
         description: "Optional page cap for testing. 0 = no cap"
         required: false
         default: "0"
+      max_429_before_partial:
+        description: "Controlled PARTIAL stop after this many 429 events in full/resume_full"
+        required: false
+        default: "7"
+      max_runtime_hours:
+        description: "Controlled PARTIAL stop after runtime limit in hours. 0 = disabled"
+        required: false
+        default: "2.5"
+      head_known_pages_to_stop:
+        description: "Stop head incremental after this many known pages in a row"
+        required: false
+        default: "20"
+      tail_known_pages_to_stop:
+        description: "Stop tail incremental after this many known pages in a row"
+        required: false
+        default: "20"
+      resume_overlap_pages:
+        description: "Overlap pages when resuming a partial full run"
+        required: false
+        default: "250"
+      slow_rps:
+        description: "Slow RPS for resume_full head/tail refresh"
+        required: false
+        default: "0.3"
       skip_csv_zip:
         description: "Skip CSV ZIP export"
         required: false
@@ -84,7 +109,7 @@ jobs:
 
           ls -lh inputs || true
 
-      - name: Run Platform Raw
+      - name: Run Platform UDI Raw
         run: |
           EXTRA_ARGS=""
           if [ "${{ github.event.inputs.skip_csv_zip || 'false' }}" = "true" ]; then
@@ -97,7 +122,13 @@ jobs:
             --inputs-dir inputs \
             --release-timestamp "${{ steps.timestamp.outputs.timestamp }}" \
             --max-rps "${{ github.event.inputs.max_rps || '1.0' }}" \
+            --slow-rps "${{ github.event.inputs.slow_rps || '0.3' }}" \
             --max-pages "${{ github.event.inputs.max_pages || '0' }}" \
+            --max-429-before-partial "${{ github.event.inputs.max_429_before_partial || '7' }}" \
+            --max-runtime-hours "${{ github.event.inputs.max_runtime_hours || '2.5' }}" \
+            --head-known-pages-to-stop "${{ github.event.inputs.head_known_pages_to_stop || '20' }}" \
+            --tail-known-pages-to-stop "${{ github.event.inputs.tail_known_pages_to_stop || '20' }}" \
+            --resume-overlap-pages "${{ github.event.inputs.resume_overlap_pages || '250' }}" \
             $EXTRA_ARGS
 
       - name: List output
