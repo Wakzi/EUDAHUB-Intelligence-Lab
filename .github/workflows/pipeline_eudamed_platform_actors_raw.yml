@@ -1,0 +1,204 @@
+name: Pipeline EUDAMED Platform Actors Raw
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Fetch mode"
+        required: false
+        default: "incremental"
+        type: choice
+        options:
+          - incremental
+          - full
+          - resume_full
+      max_rps:
+        description: "Max requests per second"
+        required: false
+        default: "1.0"
+      max_pages:
+        description: "Optional page cap for testing. 0 = no cap"
+        required: false
+        default: "0"
+      max_429_before_partial:
+        description: "Controlled PARTIAL stop after this many 429 events in full/resume_full"
+        required: false
+        default: "7"
+      max_body_runtime_hours:
+        description: "Controlled PARTIAL stop after body/full runtime limit in hours. 0 = disabled"
+        required: false
+        default: "2.5"
+      max_total_runtime_hours:
+        description: "Total runtime guard for resume_full head/tail after body. 0 = disabled"
+        required: false
+        default: "3.0"
+      head_known_pages_to_stop:
+        description: "Stop head incremental after this many known pages in a row"
+        required: false
+        default: "20"
+      tail_known_pages_to_stop:
+        description: "Stop tail incremental after this many known pages in a row"
+        required: false
+        default: "20"
+      resume_overlap_pages:
+        description: "Overlap pages when resuming a partial full run"
+        required: false
+        default: "250"
+      slow_rps:
+        description: "Slow RPS for resume_full head/tail refresh"
+        required: false
+        default: "0.3"
+      skip_csv_zip:
+        description: "Skip CSV ZIP export"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: eudamed-platform-actors-raw
+  cancel-in-progress: false
+
+env:
+  DATA_REPO: Wakzi/EUDAHUB-Intelligence-Data
+  OUT_DIR: dist/eudamed_platform_actors_raw
+
+jobs:
+  fetch-platform-raw:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install duckdb pandas requests
+
+      - name: Generate UTC timestamp
+        id: timestamp
+        run: |
+          echo "timestamp=$(date -u +'%Y%m%d_%H%M%S')" >> "$GITHUB_OUTPUT"
+          echo "timestamp_human=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare previous latest input
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          set +e
+          mkdir -p inputs
+
+          gh release download "eudamed-platform-actors-raw-latest" \
+            --repo "$DATA_REPO" \
+            --pattern "eudamed_platform_actors_raw_latest.duckdb" \
+            --dir inputs \
+            --clobber || true
+
+          gh release download "eudamed-platform-actors-raw-latest" \
+            --repo "$DATA_REPO" \
+            --pattern "eudamed_platform_actors_raw_latest.metadata.json" \
+            --dir inputs \
+            --clobber || true
+
+          ls -lh inputs || true
+
+      - name: Run Platform Actors Raw
+        run: |
+          EXTRA_ARGS=""
+          if [ "${{ github.event.inputs.skip_csv_zip || 'false' }}" = "true" ]; then
+            EXTRA_ARGS="--skip-csv-zip"
+          fi
+
+          python -u pipelines/eudamed/pipeline_eudamed_platform_actors_raw.py \
+            --mode "${{ github.event.inputs.mode || 'incremental' }}" \
+            --out-dir "$OUT_DIR" \
+            --inputs-dir inputs \
+            --release-timestamp "${{ steps.timestamp.outputs.timestamp }}" \
+            --max-rps "${{ github.event.inputs.max_rps || '1.0' }}" \
+            --slow-rps "${{ github.event.inputs.slow_rps || '0.3' }}" \
+            --max-pages "${{ github.event.inputs.max_pages || '0' }}" \
+            --max-429-before-partial "${{ github.event.inputs.max_429_before_partial || '7' }}" \
+            --max-body-runtime-hours "${{ github.event.inputs.max_body_runtime_hours || '2.5' }}" \
+            --max-total-runtime-hours "${{ github.event.inputs.max_total_runtime_hours || '3.0' }}" \
+            --head-known-pages-to-stop "${{ github.event.inputs.head_known_pages_to_stop || '20' }}" \
+            --tail-known-pages-to-stop "${{ github.event.inputs.tail_known_pages_to_stop || '20' }}" \
+            --resume-overlap-pages "${{ github.event.inputs.resume_overlap_pages || '250' }}" \
+            $EXTRA_ARGS
+
+      - name: List output
+        run: |
+          find "$OUT_DIR" -maxdepth 1 -type f -print -exec ls -lh {} \;
+
+      - name: Validate output files
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          test -f "$OUT_DIR/eudamed_platform_actors_raw_latest.duckdb"
+          test -f "$OUT_DIR/eudamed_platform_actors_raw_latest.metadata.json"
+          test -f "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_ACTORS_RAW.md"
+          test -f "$OUT_DIR/eudamed_platform_actors_raw_${TS}.duckdb"
+          test -f "$OUT_DIR/eudamed_platform_actors_raw_${TS}.metadata.json"
+          test -f "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_ACTORS_RAW_${TS}.md"
+
+      - name: Create dated release in Data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TS="${{ steps.timestamp.outputs.timestamp }}"
+          TAG="eudamed-platform-actors-raw-${TS}"
+          TITLE="EUDAMED Platform Actors Raw - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$DATA_REPO"
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "$TITLE" \
+            --notes-file "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_ACTORS_RAW_${TS}.md" \
+            --latest=false
+
+          gh release upload "$TAG" \
+            "$OUT_DIR/eudamed_platform_actors_raw_${TS}.duckdb" \
+            "$OUT_DIR/eudamed_platform_actors_raw_${TS}.metadata.json" \
+            "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_ACTORS_RAW_${TS}.md" \
+            --repo "$REPO" \
+            --clobber
+
+          if [ -f "$OUT_DIR/eudamed_platform_actors_raw_${TS}_csv.zip" ]; then
+            gh release upload "$TAG" "$OUT_DIR/eudamed_platform_actors_raw_${TS}_csv.zip" --repo "$REPO" --clobber
+          fi
+
+      - name: Create latest release in Data repo
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          TAG="eudamed-platform-actors-raw-latest"
+          TITLE="Latest EUDAMED Platform Actors Raw - ${{ steps.timestamp.outputs.timestamp_human }}"
+          REPO="$DATA_REPO"
+
+          gh release delete "$TAG" --repo "$REPO" --yes --cleanup-tag || true
+
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --title "$TITLE" \
+            --notes-file "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_ACTORS_RAW.md" \
+            --latest=false
+
+          gh release upload "$TAG" \
+            "$OUT_DIR/eudamed_platform_actors_raw_latest.duckdb" \
+            "$OUT_DIR/eudamed_platform_actors_raw_latest.metadata.json" \
+            "$OUT_DIR/RELEASE_NOTES_EUDAMED_PLATFORM_ACTORS_RAW.md" \
+            --repo "$REPO" \
+            --clobber
+
+          if [ -f "$OUT_DIR/eudamed_platform_actors_raw_latest_csv.zip" ]; then
+            gh release upload "$TAG" "$OUT_DIR/eudamed_platform_actors_raw_latest_csv.zip" --repo "$REPO" --clobber
+          fi
