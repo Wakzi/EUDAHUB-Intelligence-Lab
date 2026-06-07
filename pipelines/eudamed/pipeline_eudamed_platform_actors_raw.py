@@ -60,7 +60,7 @@ import duckdb
 import pandas as pd
 import requests
 
-PIPELINE_VERSION = "v1.0.0"
+PIPELINE_VERSION = "v1.0.1"
 BASE_URL_DEFAULT = "https://ec.europa.eu/tools/eudamed/api"
 ACTORS_ENDPOINT = "/eos"
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -838,11 +838,13 @@ def fetch_full(
     client: EudamedClient,
     initial_data: Dict[str, Any],
     initial_meta: Dict[str, Any],
+    existing_uuid_set: set,
     extract_date: str,
     extract_ts: str,
     max_pages: int = 0,
     max_429_before_partial: int = 7,
     max_body_runtime_hours: float = 0.0,
+    log_every_pages: int = 5,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], bool]:
     total_pages = int(initial_meta.get("total_pages") or 0)
     if max_pages and max_pages > 0:
@@ -866,6 +868,7 @@ def fetch_full(
             initial_meta=initial_meta if page == 0 else None,
             include_historical=True,
         )
+        new_n, refreshed_n = count_new_and_refreshed(rows, existing_uuid_set)
         if ok:
             received_rows.extend(rows)
             last_successful_page = page
@@ -875,9 +878,10 @@ def fetch_full(
             stop_reason = "page_fetch_failed"
         pages_done = page + 1
         detailed = len(client.throttle_events) > 0
-        should_log = detailed or page % 50 == 0 or page == total_pages - 1 or not ok
+        log_mod = max(1, int(log_every_pages or 1))
+        should_log = detailed or page % log_mod == 0 or page == total_pages - 1 or not ok
         if should_log:
-            log(phase_log_line("Full", page, total_pages, len(rows), 0, len(rows), None, None, status, elapsed_ms, retry_after, len(received_rows), pages_done, total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), None if ok else stop_reason, eta_remaining_pages=max(0, total_pages - page - 1)))
+            log(phase_log_line("Full", page, total_pages, len(rows), new_n, refreshed_n, None, None, status, elapsed_ms, retry_after, len(received_rows), pages_done, total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), None if ok else stop_reason, eta_remaining_pages=max(0, total_pages - page - 1)))
         if not ok:
             break
         if max_429_before_partial and len(client.throttle_events) >= max_429_before_partial:
@@ -1329,6 +1333,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--max-runtime-hours", type=float, default=None, help="Backward compatible alias for --max-body-runtime-hours")
     p.add_argument("--max-body-runtime-hours", type=float, default=2.5)
     p.add_argument("--max-total-runtime-hours", type=float, default=3.0)
+    p.add_argument("--log-every-pages", type=int, default=5, help="Full-mode progress log cadence in pages")
     p.add_argument("--release-timestamp", default=None)
     p.add_argument("--skip-csv-zip", action="store_true")
     return p.parse_args(argv)
@@ -1426,10 +1431,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     else:
         received_rows, page_audit, request_log, audit, normal_completion = fetch_full(
-            client, initial_data, initial_meta, extract_date, extract_ts,
+            client, initial_data, initial_meta, existing_uuid_set, extract_date, extract_ts,
             max_pages=args.max_pages,
             max_429_before_partial=args.max_429_before_partial,
             max_body_runtime_hours=args.max_body_runtime_hours,
+            log_every_pages=args.log_every_pages,
         )
 
     current_initial_probe: Dict[str, Any] = {}
@@ -1534,6 +1540,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "max_runtime_hours": args.max_runtime_hours,
         "max_body_runtime_hours": args.max_body_runtime_hours,
         "max_total_runtime_hours": args.max_total_runtime_hours,
+        "log_every_pages": args.log_every_pages,
         "body_include_historical": body_include_historical,
         "head_known_pages_to_stop": args.head_known_pages_to_stop,
         "tail_known_pages_to_stop": args.tail_known_pages_to_stop,
