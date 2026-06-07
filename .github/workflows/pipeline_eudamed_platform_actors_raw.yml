@@ -20,6 +20,10 @@ on:
         description: "Optional page cap for testing. 0 = no cap"
         required: false
         default: "0"
+      log_every_pages:
+        description: "Full-mode progress log cadence in pages"
+        required: false
+        default: "5"
       max_429_before_partial:
         description: "Controlled PARTIAL stop after this many 429 events in full/resume_full"
         required: false
@@ -128,6 +132,7 @@ jobs:
             --max-rps "${{ github.event.inputs.max_rps || '1.0' }}" \
             --slow-rps "${{ github.event.inputs.slow_rps || '0.3' }}" \
             --max-pages "${{ github.event.inputs.max_pages || '0' }}" \
+            --log-every-pages "${{ github.event.inputs.log_every_pages || '5' }}" \
             --max-429-before-partial "${{ github.event.inputs.max_429_before_partial || '7' }}" \
             --max-body-runtime-hours "${{ github.event.inputs.max_body_runtime_hours || '2.5' }}" \
             --max-total-runtime-hours "${{ github.event.inputs.max_total_runtime_hours || '3.0' }}" \
