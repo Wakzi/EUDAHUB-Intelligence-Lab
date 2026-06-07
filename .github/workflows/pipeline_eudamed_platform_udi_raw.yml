@@ -24,10 +24,14 @@ on:
         description: "Controlled PARTIAL stop after this many 429 events in full/resume_full"
         required: false
         default: "7"
-      max_runtime_hours:
-        description: "Controlled PARTIAL stop after runtime limit in hours. 0 = disabled"
+      max_body_runtime_hours:
+        description: "Controlled PARTIAL stop after body/full runtime limit in hours. 0 = disabled"
         required: false
         default: "2.5"
+      max_total_runtime_hours:
+        description: "Total runtime guard for resume_full head/tail after body. 0 = disabled"
+        required: false
+        default: "3.0"
       head_known_pages_to_stop:
         description: "Stop head incremental after this many known pages in a row"
         required: false
@@ -125,7 +129,8 @@ jobs:
             --slow-rps "${{ github.event.inputs.slow_rps || '0.3' }}" \
             --max-pages "${{ github.event.inputs.max_pages || '0' }}" \
             --max-429-before-partial "${{ github.event.inputs.max_429_before_partial || '7' }}" \
-            --max-runtime-hours "${{ github.event.inputs.max_runtime_hours || '2.5' }}" \
+            --max-body-runtime-hours "${{ github.event.inputs.max_body_runtime_hours || '2.5' }}" \
+            --max-total-runtime-hours "${{ github.event.inputs.max_total_runtime_hours || '3.0' }}" \
             --head-known-pages-to-stop "${{ github.event.inputs.head_known_pages_to_stop || '20' }}" \
             --tail-known-pages-to-stop "${{ github.event.inputs.tail_known_pages_to_stop || '20' }}" \
             --resume-overlap-pages "${{ github.event.inputs.resume_overlap_pages || '250' }}" \
