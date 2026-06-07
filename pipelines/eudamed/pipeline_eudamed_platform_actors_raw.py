@@ -60,7 +60,7 @@ import duckdb
 import pandas as pd
 import requests
 
-PIPELINE_VERSION = "v1.0.1"
+PIPELINE_VERSION = "v1.0.2"
 BASE_URL_DEFAULT = "https://ec.europa.eu/tools/eudamed/api"
 ACTORS_ENDPOINT = "/eos"
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -175,13 +175,25 @@ def decode_ulid(ulid: Optional[str]) -> Optional[str]:
     return dt.datetime.fromtimestamp(ms / 1000, tz=dt.timezone.utc).isoformat()
 
 
+def clean_ulid_values(values: Iterable[Optional[str]]) -> List[str]:
+    vals: List[str] = []
+    for v in values:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s or s.lower() in {"nan", "none", "null", "nat"}:
+            continue
+        vals.append(s)
+    return vals
+
+
 def min_ulid(values: Iterable[Optional[str]]) -> Optional[str]:
-    vals = [str(v) for v in values if v]
+    vals = clean_ulid_values(values)
     return min(vals) if vals else None
 
 
 def max_ulid(values: Iterable[Optional[str]]) -> Optional[str]:
-    vals = [str(v) for v in values if v]
+    vals = clean_ulid_values(values)
     return max(vals) if vals else None
 
 
@@ -1254,7 +1266,8 @@ def write_release_notes(path: Path, metadata: Dict[str, Any]) -> None:
         f"- Distinct EUDAMED identifiers: `{metadata.get('distinct_eudamed_identifier_count')}`",
         f"- latest_version=true rows: `{metadata.get('latest_version_true_count')}`",
         f"- latest_version=false rows: `{metadata.get('latest_version_false_count')}`",
-        f"- Completeness ratio vs API total: `{metadata.get('completeness_ratio')}`",
+        f"- Current completeness ratio vs current API: `{metadata.get('current_completeness_ratio')}`",
+        f"- Historical completeness ratio vs historical API: `{metadata.get('historical_completeness_ratio')}`",
         "",
         "## Merge",
         "",
@@ -1295,6 +1308,12 @@ def write_release_notes(path: Path, metadata: Dict[str, Any]) -> None:
         f"- Recent rate 50: `{(metadata.get('telemetry') or {}).get('recent_rate_50')}`",
         f"- Recent avg response 50 ms: `{(metadata.get('telemetry') or {}).get('recent_avg_response_ms_50')}`",
         f"- Detailed logging enabled: `{(metadata.get('telemetry') or {}).get('detailed_logging_enabled')}`",
+        "",
+        "## Current actor selection rule",
+        "",
+        "- Primary rule: `latest_version=true`.",
+        "- Fallback rule for EUDAMED edge cases: highest `version_number` within the same ULID/SRN.",
+        "- This rule is used by downstream actor detail/current pipelines, not to filter Actors Raw itself.",
         "",
         "## Interpretation",
         "",
@@ -1497,7 +1516,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     row_count = len(merged_rows)
     min_u = min_ulid(r.get("ulid") for r in merged_rows)
     max_u = max_ulid(r.get("ulid") for r in merged_rows)
-    completeness_ratio = (row_count / api_total_elements) if api_total_elements else None
     distinct_uuid_count = len({r.get("uuid") for r in merged_rows if r.get("uuid")})
     distinct_ulid_count = len({r.get("ulid") for r in merged_rows if r.get("ulid")})
     distinct_srn_count = len({r.get("srn") for r in merged_rows if r.get("srn")})
@@ -1515,6 +1533,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     current_total_elements = (audit or {}).get("current_total_elements") or current_initial_probe.get("total_elements") or (api_total_elements if not body_include_historical else None)
     current_total_pages = (audit or {}).get("current_total_pages") or current_initial_probe.get("total_pages") or (api_total_pages if not body_include_historical else None)
     current_initial_page = (audit or {}).get("current_initial_page") or current_initial_probe or None
+    current_completeness_ratio = (latest_version_true_count / current_total_elements) if current_total_elements else None
+    historical_completeness_ratio = (row_count / historical_total_elements) if historical_total_elements else None
+    # Backward-compatible field. In historical/full runs this is historical completeness;
+    # in current/incremental runs this is current completeness, never historical rows divided by current API count.
+    completeness_ratio = historical_completeness_ratio if body_include_historical else current_completeness_ratio
 
     status_summary: Dict[Tuple[str, int], int] = {}
     for r in request_log:
@@ -1560,6 +1583,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "latest_version_true_count": latest_version_true_count,
         "latest_version_false_count": latest_version_false_count,
         "row_count": row_count,
+        "current_completeness_ratio": current_completeness_ratio,
+        "historical_completeness_ratio": historical_completeness_ratio,
         "completeness_ratio": completeness_ratio,
         "min_ulid": min_u,
         "min_ulid_timestamp": decode_ulid(min_u),
