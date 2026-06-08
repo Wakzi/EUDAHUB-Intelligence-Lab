@@ -3,7 +3,7 @@
 """
 EUDAMED Platform Actor Details Raw acquisition pipeline.
 
-Pipeline version: v1.0.0
+Pipeline version: v1.1.0
 
 Scope
 -----
@@ -17,9 +17,10 @@ Design
 - Detail endpoint: /actors/{uuid}/publicInformation.
 - actors_raw is the authority for which actor UUIDs exist.
 - actor_details_raw stores one raw detail response per actor UUID.
-- Incremental means: fetch actor UUIDs present in actors_raw but missing from actor_details_raw.
-- Current means: fetch one current candidate per actor identity.
-- Historical means: fetch non-current actor UUIDs only.
+- Incremental means: fetch all actor UUIDs present in actors_raw but missing from actor_details_raw.
+- Incremental current means: fetch current actor UUIDs missing from actor_details_raw.
+- Full current means: fetch one current candidate per actor identity.
+- Full historical means: fetch non-current actor UUIDs only.
 - Full means: fetch all actor UUIDs from actors_raw.
 - Resume modes continue a previous partial candidate list by deterministic index.
 
@@ -64,7 +65,7 @@ import duckdb
 import pandas as pd
 import requests
 
-PIPELINE_VERSION = "v1.0.0"
+PIPELINE_VERSION = "v1.1.0"
 BASE_URL_DEFAULT = "https://ec.europa.eu/tools/eudamed/api"
 ACTOR_DETAILS_ENDPOINT_TEMPLATE = "/actors/{uuid}/publicInformation"
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -76,8 +77,9 @@ RUN_FAILED = "FAILED"
 
 DETAIL_MODES = {
     "incremental", "resume_incremental",
-    "current", "resume_current",
-    "historical", "resume_historical",
+    "incremental_current", "resume_incremental_current",
+    "full_current", "resume_full_current",
+    "full_historical", "resume_full_historical",
     "full", "resume_full",
 }
 
@@ -346,6 +348,19 @@ def flatten_detail(response: Dict[str, Any], requested_uuid: str, extract_date: 
 
 DETAIL_COLUMNS = list(flatten_detail({}, "", "", "").keys())
 
+CSV_EXCLUDED_COLUMNS = {
+    "raw_json",
+    "regulatory_compliance_responsibles_json",
+    "accuracy_data_json",
+    "organization_identification_documents_json",
+    "importers_json",
+    "non_eu_manufacturers_json",
+    "acquisitions_json",
+    "certificates_json",
+    "legislation_links_json",
+}
+CSV_COLUMNS = [c for c in DETAIL_COLUMNS if c not in CSV_EXCLUDED_COLUMNS]
+
 
 class EudamedClient:
     def __init__(self, base_url: str, language: str, timeout: int, retries: int, backoff: float, max_rps: float):
@@ -551,8 +566,8 @@ def extract_resume_state(previous_metadata: Dict[str, Any], requested_mode: str)
     state = previous_metadata.get("resume_state") or (previous_metadata.get("audit") or {}).get("resume_state") or {}
     if not state:
         return {}
-    base_mode = requested_mode.replace("resume_", "")
-    if state.get("base_mode") and state.get("base_mode") != base_mode:
+    base_mode = canonical_base_mode(requested_mode)
+    if state.get("base_mode") and canonical_base_mode(str(state.get("base_mode"))) != base_mode:
         return {}
     return state
 
@@ -601,6 +616,19 @@ def current_candidate_uuids(actors: List[Dict[str, Any]]) -> set:
     return chosen
 
 
+def canonical_base_mode(mode: str) -> str:
+    base = mode.replace("resume_", "")
+    aliases = {
+        "current": "full_current",
+        "historical": "full_historical",
+    }
+    return aliases.get(base, base)
+
+
+def resume_mode_for_base(base_mode: str) -> str:
+    return f"resume_{base_mode}"
+
+
 def choose_candidates(mode: str, actors: List[Dict[str, Any]], existing_detail_rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     dedup: Dict[str, Dict[str, Any]] = {}
     for r in actors:
@@ -616,22 +644,27 @@ def choose_candidates(mode: str, actors: List[Dict[str, Any]], existing_detail_r
     all_rows = list(dedup.values())
     current_uuids = current_candidate_uuids(all_rows)
     existing_uuids = {r.get("uuid") for r in existing_detail_rows if r.get("uuid")}
-    base_mode = mode.replace("resume_", "")
+    base_mode = canonical_base_mode(mode)
     if base_mode == "full":
         candidates = all_rows
-    elif base_mode == "current":
+    elif base_mode == "full_current":
         candidates = [r for r in all_rows if r.get("uuid") in current_uuids]
-    elif base_mode == "historical":
+    elif base_mode == "full_historical":
         candidates = [r for r in all_rows if r.get("uuid") not in current_uuids]
     elif base_mode == "incremental":
         candidates = [r for r in all_rows if r.get("uuid") not in existing_uuids]
+    elif base_mode == "incremental_current":
+        candidates = [r for r in all_rows if r.get("uuid") in current_uuids and r.get("uuid") not in existing_uuids]
     else:
         raise ValueError(f"Unsupported mode: {mode}")
     candidates = sorted(candidates, key=lambda r: (str(r.get("ulid") or ""), int_or_minus(r.get("version_number")), str(r.get("uuid") or "")))
     stats = {
         "actors_raw_rows": len(actors),
         "actors_raw_distinct_uuid_count": len(all_rows),
+        "full_current_candidate_count": len(current_uuids),
         "current_candidate_count": len(current_uuids),
+        "full_historical_candidate_count": len(all_rows) - len(current_uuids),
+        "historical_candidate_count": len(all_rows) - len(current_uuids),
         "existing_detail_uuid_count": len(existing_uuids),
         "candidate_count": len(candidates),
         "base_mode": base_mode,
@@ -639,17 +672,38 @@ def choose_candidates(mode: str, actors: List[Dict[str, Any]], existing_detail_r
     return candidates, stats
 
 
-def progress_line(mode: str, idx: int, total: int, ok_count: int, fail_count: int, started_at: float, response_ms: List[float], throttle_count: int) -> str:
+def progress_line(
+    mode: str,
+    idx: int,
+    total: int,
+    ok_count: int,
+    fail_count: int,
+    started_at: float,
+    response_ms: List[float],
+    throttle_count: int,
+    start_index: int,
+    total_new: int,
+    total_refreshed: int,
+    batch_new: int,
+    batch_refreshed: int,
+) -> str:
     elapsed = max(0.001, time.monotonic() - started_at)
-    done = idx + 1
-    rate = done / elapsed
-    remaining = max(0, total - done)
+    global_done = idx + 1
+    processed_this_run = ok_count + fail_count
+    rate = processed_this_run / elapsed if processed_this_run else 0.0
+    remaining = max(0, total - global_done)
     eta = remaining / rate if rate > 0 else None
     avg_ms = sum(response_ms) / len(response_ms) if response_ms else 0.0
+    recent = response_ms[-100:]
+    recent_elapsed = sum(recent) / 1000.0 if recent else 0.0
+    recent_rate_response_limited = len(recent) / recent_elapsed if recent_elapsed > 0 else 0.0
     return (
-        f"{mode} detail={done}/{total} ({(done/total*100.0 if total else 0):.2f}%) | "
+        f"{mode} detail={global_done}/{total} ({(global_done/total*100.0 if total else 0):.2f}%) | "
+        f"processed={processed_this_run:,} | remaining={remaining:,} | "
+        f"new={batch_new:,} | refreshed={batch_refreshed:,} | total_new={total_new:,} | total_refreshed={total_refreshed:,} | "
         f"ok={ok_count:,} | failed={fail_count:,} | rate={rate:.3f} req/s | avg_response={avg_ms:.0f} ms | "
-        f"429_count={throttle_count} | elapsed={fmt_duration(elapsed)} | ETA={fmt_duration(eta)}"
+        f"recent_response_rate_100={recent_rate_response_limited:.3f} req/s | 429_count={throttle_count} | "
+        f"elapsed={fmt_duration(elapsed)} | ETA={fmt_duration(eta)}"
     )
 
 
@@ -668,6 +722,7 @@ def fetch_details(
     max_runtime_hours: float,
     max_429_before_partial: int,
     log_every_records: int,
+    existing_detail_uuid_set: Optional[set] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], bool]:
     total = len(candidates)
     rows: List[Dict[str, Any]] = []
@@ -681,6 +736,11 @@ def fetch_details(
     stop_reason = "all_candidates_fetched"
     last_successful_index: Optional[int] = None
     processed = 0
+    existing_detail_uuid_set = existing_detail_uuid_set or set()
+    total_new = 0
+    total_refreshed = 0
+    batch_new = 0
+    batch_refreshed = 0
 
     log(f"=== Actor Details fetch mode={mode} start_index={start_index} total_candidates={total} ===")
     for idx in range(start_index, total):
@@ -715,6 +775,13 @@ def fetch_details(
                 row["uuid"] = actor_uuid
             rows.append(row)
             ok_count += 1
+            row_uuid = row.get("uuid") or actor_uuid
+            if row_uuid in existing_detail_uuid_set:
+                total_refreshed += 1
+                batch_refreshed += 1
+            else:
+                total_new += 1
+                batch_new += 1
             last_successful_index = idx
         else:
             fail_count += 1
@@ -728,7 +795,9 @@ def fetch_details(
             break
         should_log = (processed == 1 or processed % max(1, log_every_records) == 0 or idx == total - 1)
         if should_log:
-            log(progress_line(mode, idx, total, ok_count, fail_count, started_at, response_ms, len(client.throttle_events)))
+            log(progress_line(mode, idx, total, ok_count, fail_count, started_at, response_ms, len(client.throttle_events), start_index, total_new, total_refreshed, batch_new, batch_refreshed))
+            batch_new = 0
+            batch_refreshed = 0
 
     next_index = (last_successful_index + 1) if last_successful_index is not None else start_index
     if next_index >= total and fail_count == 0:
@@ -736,7 +805,7 @@ def fetch_details(
         stop_reason = "all_candidates_fetched"
     audit = {
         "mode": mode,
-        "base_mode": mode.replace("resume_", ""),
+        "base_mode": canonical_base_mode(mode),
         "start_index": start_index,
         "total_candidates": total,
         "processed_candidates": processed,
@@ -747,8 +816,8 @@ def fetch_details(
         "last_successful_index": last_successful_index,
         "next_index": next_index,
         "resume_state": None if normal_completion else {
-            "resume_mode": f"resume_{mode.replace('resume_', '')}",
-            "base_mode": mode.replace("resume_", ""),
+            "resume_mode": resume_mode_for_base(canonical_base_mode(mode)),
+            "base_mode": canonical_base_mode(mode),
             "last_successful_index": last_successful_index,
             "next_index": next_index,
             "total_candidates": total,
@@ -761,6 +830,8 @@ def fetch_details(
             "status_counts": {str(k): v for k, v in sorted(status_counts.items())},
             "throttle_429_count": len(client.throttle_events),
             "throttle_events": client.throttle_events,
+            "new_details": total_new,
+            "refreshed_details": total_refreshed,
         },
     }
     return rows, request_log, audit, normal_completion
@@ -840,10 +911,10 @@ def write_csv_zip(zip_path: Path, rows: List[Dict[str, Any]]) -> None:
     ensure_dir(tmp)
     csv_path = tmp / "actor_details_raw.csv"
     with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=DETAIL_COLUMNS, extrasaction="ignore", quoting=csv.QUOTE_MINIMAL)
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore", quoting=csv.QUOTE_MINIMAL)
         writer.writeheader()
         for r in rows:
-            writer.writerow({c: r.get(c) for c in DETAIL_COLUMNS})
+            writer.writerow({c: r.get(c) for c in CSV_COLUMNS})
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         zf.write(csv_path, "actor_details_raw.csv")
     shutil.rmtree(tmp)
@@ -879,7 +950,8 @@ def write_release_notes(path: Path, metadata: Dict[str, Any]) -> None:
         "",
         f"- Actors Raw rows: `{metadata.get('candidate_stats', {}).get('actors_raw_rows')}`",
         f"- Actors Raw distinct UUIDs: `{metadata.get('candidate_stats', {}).get('actors_raw_distinct_uuid_count')}`",
-        f"- Current candidates: `{metadata.get('candidate_stats', {}).get('current_candidate_count')}`",
+        f"- Full current candidates: `{metadata.get('candidate_stats', {}).get('full_current_candidate_count')}`",
+        f"- Full historical candidates: `{metadata.get('candidate_stats', {}).get('full_historical_candidate_count')}`",
         f"- Existing detail UUIDs before run: `{metadata.get('candidate_stats', {}).get('existing_detail_uuid_count')}`",
         f"- Selected candidates: `{metadata.get('candidate_stats', {}).get('candidate_count')}`",
         "",
@@ -889,6 +961,8 @@ def write_release_notes(path: Path, metadata: Dict[str, Any]) -> None:
         f"- Received rows this run: `{metadata.get('merge', {}).get('received_rows')}`",
         f"- Inserted UUIDs: `{metadata.get('merge', {}).get('inserted_uuid_count')}`",
         f"- Refreshed UUIDs: `{metadata.get('merge', {}).get('refreshed_uuid_count')}`",
+        f"- New details this run: `{metadata.get('new_details_this_run')}`",
+        f"- Refreshed details this run: `{metadata.get('refreshed_details_this_run')}`",
         f"- Retained UUIDs from previous latest: `{metadata.get('merge', {}).get('retained_uuid_count')}`",
         f"- Merged rows: `{metadata.get('merge', {}).get('merged_rows')}`",
         "",
@@ -904,6 +978,8 @@ def write_release_notes(path: Path, metadata: Dict[str, Any]) -> None:
         f"- Processed candidates: `{metadata.get('audit', {}).get('processed_candidates')}`",
         f"- Successful details: `{metadata.get('audit', {}).get('successful_details')}`",
         f"- Failed details: `{metadata.get('audit', {}).get('failed_details')}`",
+        f"- New details: `{metadata.get('audit', {}).get('new_details')}`",
+        f"- Refreshed details: `{metadata.get('audit', {}).get('refreshed_details')}`",
         "",
         "## Resume state",
         "",
@@ -914,6 +990,10 @@ def write_release_notes(path: Path, metadata: Dict[str, Any]) -> None:
         f"- Requests/sec: `{(metadata.get('telemetry') or {}).get('requests_per_second')}`",
         f"- Avg response ms: `{(metadata.get('telemetry') or {}).get('avg_response_ms')}`",
         f"- 429 count: `{(metadata.get('telemetry') or {}).get('throttle_429_count')}`",
+        "",
+        "## CSV export",
+        "",
+        f"- CSV excluded columns: `{json.dumps(metadata.get('csv_excluded_columns') or [], ensure_ascii=False)}`",
         "",
         "## Current actor selection rule",
         "",
@@ -944,7 +1024,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--base-url", default=BASE_URL_DEFAULT)
     p.add_argument("--language", default="en")
     p.add_argument("--max-records", type=int, default=0, help="Optional candidate cap for testing. 0 = no cap")
-    p.add_argument("--max-rps", type=float, default=1.0)
+    p.add_argument("--max-rps", type=float, default=0.9)
     p.add_argument("--timeout", type=int, default=60)
     p.add_argument("--retries", type=int, default=4)
     p.add_argument("--backoff", type=float, default=1.5)
@@ -1004,7 +1084,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             start_index = max(0, int(state.get("next_index") or 0) - max(0, int(args.resume_overlap_records or 0)))
             log(f"Resume state found: next_index={state.get('next_index')} overlap={args.resume_overlap_records} start_index={start_index}")
         else:
-            effective_mode = args.mode.replace("resume_", "")
+            effective_mode = canonical_base_mode(args.mode)
             log(f"No compatible resume state found. Falling back to effective_mode={effective_mode}")
     elif not previous_rows and args.mode == "incremental":
         # Incremental without previous detail DB is a bootstrap detail run over all missing UUIDs.
@@ -1022,6 +1102,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_runtime_hours=args.max_runtime_hours,
         max_429_before_partial=args.max_429_before_partial,
         log_every_records=args.log_every_records,
+        existing_detail_uuid_set={r.get("uuid") for r in previous_rows if r.get("uuid")},
     )
 
     usable_received = len(received_rows)
@@ -1109,6 +1190,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "max_ulid_timestamp": decode_ulid(max_u),
         "previous_rows": len(previous_rows),
         "received_rows": len(received_rows),
+        "new_details_this_run": (audit or {}).get("new_details"),
+        "refreshed_details_this_run": (audit or {}).get("refreshed_details"),
+        "csv_excluded_columns": sorted(CSV_EXCLUDED_COLUMNS),
         "normal_completion": normal_completion,
         "audit": audit,
         "resume_state": audit.get("resume_state"),
@@ -1155,6 +1239,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "effective_mode": effective_mode,
         "row_count": row_count,
         "received_rows": len(received_rows),
+        "new_details_this_run": metadata.get("new_details_this_run"),
+        "refreshed_details_this_run": metadata.get("refreshed_details_this_run"),
         "previous_rows": len(previous_rows),
         "candidate_stats": candidate_stats,
         "merge": merge_stats,
