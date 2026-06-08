@@ -11,16 +11,18 @@ on:
         options:
           - incremental
           - resume_incremental
-          - current
-          - resume_current
-          - historical
-          - resume_historical
+          - incremental_current
+          - resume_incremental_current
+          - full_current
+          - resume_full_current
+          - full_historical
+          - resume_full_historical
           - full
           - resume_full
       max_rps:
         description: "Max requests per second"
         required: false
-        default: "1.0"
+        default: "0.9"
       max_records:
         description: "Optional record cap for testing. 0 = no cap"
         required: false
@@ -124,7 +126,7 @@ jobs:
             --out-dir "$OUT_DIR" \
             --inputs-dir inputs \
             --release-timestamp "${{ steps.timestamp.outputs.timestamp }}" \
-            --max-rps "${{ github.event.inputs.max_rps || '1.0' }}" \
+            --max-rps "${{ github.event.inputs.max_rps || '0.9' }}" \
             --max-records "${{ github.event.inputs.max_records || '0' }}" \
             --log-every-records "${{ github.event.inputs.log_every_records || '100' }}" \
             --max-429-before-partial "${{ github.event.inputs.max_429_before_partial || '7' }}" \
