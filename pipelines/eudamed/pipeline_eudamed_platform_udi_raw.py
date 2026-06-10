@@ -60,7 +60,7 @@ import duckdb
 import pandas as pd
 import requests
 
-PIPELINE_VERSION = "v4.8.3"
+PIPELINE_VERSION = "v4.8.4"
 BASE_URL_DEFAULT = "https://ec.europa.eu/tools/eudamed/api"
 UDI_ENDPOINT = "/devices/udiDiData"
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -514,11 +514,16 @@ def request_log_row(page: int, status: int, elapsed_ms: Optional[float], retry_a
 
 
 def page_audit_row(page: int, status: int, data: Optional[Dict[str, Any]], rows: List[Dict[str, Any]], elapsed_ms: Optional[float], error: Optional[str], initial_page: bool = False) -> Dict[str, Any]:
+    uuid_diag = uuid_page_diagnostics(rows)
     return {
         "page": page,
         "status_code": status,
         "ok": status == 200,
         "rows_returned": len(rows),
+        "uuid_rows": uuid_diag["uuid_rows"],
+        "distinct_uuid_rows": uuid_diag["distinct_uuid_rows"],
+        "missing_uuid_rows": uuid_diag["missing_uuid_rows"],
+        "duplicate_uuid_on_page": uuid_diag["duplicate_uuid_on_page"],
         "api_number": data.get("number") if data else None,
         "api_first": data.get("first") if data else None,
         "api_last": data.get("last") if data else None,
@@ -538,11 +543,34 @@ def make_phase_stats(name: str) -> Dict[str, Any]:
         "rows_received": 0,
         "new_uuid_count": 0,
         "refreshed_uuid_count": 0,
+        "uuid_rows_received": 0,
+        "missing_uuid_rows": 0,
+        "duplicate_uuid_rows": 0,
         "known_pages_streak_at_stop": 0,
         "stop_reason": None,
         "start_page": None,
         "last_successful_page": None,
         "next_page_to_fetch": None,
+    }
+
+
+def uuid_page_diagnostics(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    page_uuids = [str(r.get("uuid")) for r in rows if r.get("uuid")]
+    uuid_rows = len(page_uuids)
+    distinct_uuid_rows = len(set(page_uuids))
+    return {
+        "uuid_rows": uuid_rows,
+        "distinct_uuid_rows": distinct_uuid_rows,
+        "missing_uuid_rows": max(0, len(rows) - uuid_rows),
+        "duplicate_uuid_on_page": max(0, uuid_rows - distinct_uuid_rows),
+    }
+
+
+def aggregate_uuid_diagnostics_from_audit(page_audit: List[Dict[str, Any]]) -> Dict[str, int]:
+    return {
+        "uuid_rows_received": int(sum(r.get("uuid_rows") or 0 for r in page_audit)),
+        "missing_uuid_rows": int(sum(r.get("missing_uuid_rows") or 0 for r in page_audit)),
+        "duplicate_uuid_rows": int(sum(r.get("duplicate_uuid_on_page") or 0 for r in page_audit)),
     }
 
 
@@ -573,14 +601,22 @@ def progress_values(pages_done: int, pages_total: int, rows: int, started_at: fl
     }
 
 
-def phase_log_line(phase: str, page: int, total_pages: int, rows_n: int, new_n: int, refreshed_n: int, known_streak: Optional[int], known_stop: Optional[int], status: int, elapsed_ms: Optional[float], retry_after: Optional[str], received_rows: int, pages_done: int, pages_total_for_progress: int, started_at: float, response_times_ms: List[float], status_counts: Dict[int, int], throttle_count: int, stop_reason: Optional[str] = None, eta_remaining_pages: Optional[int] = None) -> str:
+def phase_log_line(phase: str, page: int, total_pages: int, rows_n: int, new_n: int, refreshed_n: int, known_streak: Optional[int], known_stop: Optional[int], status: int, elapsed_ms: Optional[float], retry_after: Optional[str], received_rows: int, pages_done: int, pages_total_for_progress: int, started_at: float, response_times_ms: List[float], status_counts: Dict[int, int], throttle_count: int, stop_reason: Optional[str] = None, eta_remaining_pages: Optional[int] = None, uuid_rows: Optional[int] = None, missing_uuid_rows: Optional[int] = None, duplicate_uuid_on_page: Optional[int] = None, total_new: Optional[int] = None) -> str:
     pv = progress_values(pages_done, pages_total_for_progress, received_rows, started_at, response_times_ms, status_counts, throttle_count, eta_remaining_pages=eta_remaining_pages)
     known_part = ""
     if known_streak is not None and known_stop is not None:
         known_part = f" | known_streak={known_streak}/{known_stop}"
+    uuid_part = ""
+    if uuid_rows is not None:
+        uuid_part = (
+            f" | uuid_rows={uuid_rows}"
+            f" | missing_uuid_rows={missing_uuid_rows or 0}"
+            f" | duplicate_uuid_on_page={duplicate_uuid_on_page or 0}"
+        )
+    total_new_part = f" | total_new={total_new}" if total_new is not None else ""
     reason_part = f" | reason={stop_reason}" if stop_reason else ""
     return (
-        f"{phase} page={page}/{max(0, total_pages-1)} | rows={rows_n} | new={new_n} | refreshed={refreshed_n}"
+        f"{phase} page={page}/{max(0, total_pages-1)} | rows={rows_n}{uuid_part} | new={new_n}{total_new_part} | refreshed={refreshed_n}"
         f"{known_part} | status={status} | elapsed_ms={(elapsed_ms or 0):.0f} | retry_after={retry_after} | "
         f"received_rows={received_rows:,} | rate={pv['pages_per_second']:.3f} pages/s | "
         f"avg_response={pv['avg_response_ms']:.0f} ms | recent_rate_50={pv['recent_rate_50']:.3f} pages/s | "
@@ -683,15 +719,19 @@ def run_known_pages_scan(
         fetched_pages.add(page)
         pages_done_phase += 1
         stats["pages_fetched"] += 1
+        uuid_diag = uuid_page_diagnostics(rows)
         if ok:
             received_rows.extend(rows)
             stats["rows_received"] += len(rows)
+            stats["uuid_rows_received"] += uuid_diag["uuid_rows"]
+            stats["missing_uuid_rows"] += uuid_diag["missing_uuid_rows"]
+            stats["duplicate_uuid_rows"] += uuid_diag["duplicate_uuid_on_page"]
             stats["last_successful_page"] = page
             stats["next_page_to_fetch"] = page + step
         else:
             stats["stop_reason"] = f"page_{page}_fetch_failed"
             normal_completion = False
-            log(phase_log_line(phase_name, page, total_pages, len(rows), 0, 0, consecutive_known, known_pages_to_stop, status, elapsed_ms, retry_after, len(received_rows), len(page_audit), total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), stats["stop_reason"]))
+            log(phase_log_line(phase_name, page, total_pages, len(rows), 0, 0, consecutive_known, known_pages_to_stop, status, elapsed_ms, retry_after, len(received_rows), len(page_audit), total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), stats["stop_reason"], uuid_rows=uuid_diag["uuid_rows"], missing_uuid_rows=uuid_diag["missing_uuid_rows"], duplicate_uuid_on_page=uuid_diag["duplicate_uuid_on_page"], total_new=stats["new_uuid_count"]))
             break
         new_n, refreshed_n = count_new_and_refreshed(rows, existing_uuid_set)
         stats["new_uuid_count"] += new_n
@@ -699,7 +739,7 @@ def run_known_pages_scan(
         consecutive_known = consecutive_known + 1 if new_n == 0 else 0
         stats["known_pages_streak_at_stop"] = consecutive_known
         if log_every_page:
-            log(phase_log_line(phase_name, page, total_pages, len(rows), new_n, refreshed_n, consecutive_known, known_pages_to_stop, status, elapsed_ms, retry_after, len(received_rows), len(page_audit), total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events)))
+            log(phase_log_line(phase_name, page, total_pages, len(rows), new_n, refreshed_n, consecutive_known, known_pages_to_stop, status, elapsed_ms, retry_after, len(received_rows), len(page_audit), total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), uuid_rows=uuid_diag["uuid_rows"], missing_uuid_rows=uuid_diag["missing_uuid_rows"], duplicate_uuid_on_page=uuid_diag["duplicate_uuid_on_page"], total_new=stats["new_uuid_count"]))
         if len(rows) == 0:
             stats["stop_reason"] = "empty_page"
             normal_completion = True
@@ -798,6 +838,8 @@ def fetch_incremental(
     elapsed_total = time.monotonic() - started_at
     pages_ok = len([r for r in page_audit if r.get("ok")])
     normal_completion = bool(head_ok and tail_ok)
+    uuid_diag_totals = aggregate_uuid_diagnostics_from_audit(page_audit)
+    total_new_uuid_count = int((head_stats or {}).get("new_uuid_count") or 0) + int((tail_stats or {}).get("new_uuid_count") or 0)
     audit = {
         "mode": "incremental",
         "api_total_elements": initial_meta.get("total_elements"),
@@ -806,6 +848,10 @@ def fetch_incremental(
         "current_total_pages": initial_meta.get("total_pages"),
         "pages_fetched": pages_ok,
         "received_rows": len(received_rows),
+        "new_uuid_count": total_new_uuid_count,
+        "uuid_rows_received": uuid_diag_totals["uuid_rows_received"],
+        "missing_uuid_rows": uuid_diag_totals["missing_uuid_rows"],
+        "duplicate_uuid_rows": uuid_diag_totals["duplicate_uuid_rows"],
         "normal_completion": normal_completion,
         "stop_reason": "incremental_head_tail_complete" if normal_completion else "incremental_partial",
         "phases": {"head": head_stats, "tail": tail_stats},
@@ -827,6 +873,7 @@ def fetch_full(
     client: EudamedClient,
     initial_data: Dict[str, Any],
     initial_meta: Dict[str, Any],
+    existing_uuid_set: set,
     extract_date: str,
     extract_ts: str,
     max_pages: int = 0,
@@ -846,6 +893,10 @@ def fetch_full(
     response_times_ms: List[float] = []
     status_counts: Dict[int, int] = {}
     last_successful_page: Optional[int] = None
+    total_new_uuid_count = 0
+    total_uuid_rows_received = 0
+    total_missing_uuid_rows = 0
+    total_duplicate_uuid_rows = 0
 
     log(f"=== Full fetch pages 0..{total_pages - 1} ({total_pages} pages) ===")
     for page in range(total_pages):
@@ -855,9 +906,15 @@ def fetch_full(
             initial_meta=initial_meta if page == 0 else None,
             include_historical=True,
         )
+        uuid_diag = uuid_page_diagnostics(rows)
+        new_n, refreshed_n = count_new_and_refreshed(rows, existing_uuid_set)
         if ok:
             received_rows.extend(rows)
             last_successful_page = page
+            total_new_uuid_count += new_n
+            total_uuid_rows_received += uuid_diag["uuid_rows"]
+            total_missing_uuid_rows += uuid_diag["missing_uuid_rows"]
+            total_duplicate_uuid_rows += uuid_diag["duplicate_uuid_on_page"]
         else:
             failed_pages.append(page)
             normal_completion = False
@@ -866,7 +923,7 @@ def fetch_full(
         detailed = len(client.throttle_events) > 0
         should_log = detailed or page % 50 == 0 or page == total_pages - 1 or not ok
         if should_log:
-            log(phase_log_line("Full", page, total_pages, len(rows), 0, len(rows), None, None, status, elapsed_ms, retry_after, len(received_rows), pages_done, total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), None if ok else stop_reason, eta_remaining_pages=max(0, total_pages - page - 1)))
+            log(phase_log_line("Full", page, total_pages, len(rows), new_n, refreshed_n, None, None, status, elapsed_ms, retry_after, len(received_rows), pages_done, total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), None if ok else stop_reason, eta_remaining_pages=max(0, total_pages - page - 1), uuid_rows=uuid_diag["uuid_rows"], missing_uuid_rows=uuid_diag["missing_uuid_rows"], duplicate_uuid_on_page=uuid_diag["duplicate_uuid_on_page"], total_new=total_new_uuid_count))
         if not ok:
             break
         if max_429_before_partial and len(client.throttle_events) >= max_429_before_partial:
@@ -895,6 +952,10 @@ def fetch_full(
         "failed_pages": failed_pages,
         "failed_pages_count": len(failed_pages),
         "received_rows": len(received_rows),
+        "new_uuid_count": total_new_uuid_count,
+        "uuid_rows_received": total_uuid_rows_received,
+        "missing_uuid_rows": total_missing_uuid_rows,
+        "duplicate_uuid_rows": total_duplicate_uuid_rows,
         "normal_completion": normal_completion,
         "stop_reason": stop_reason,
         "last_successful_page": last_successful_page,
@@ -980,6 +1041,10 @@ def fetch_resume_full(
     status_counts: Dict[int, int] = {}
     fetched_pages: set = set()
     last_successful_body_page: Optional[int] = None
+    body_new_uuid_count = 0
+    body_uuid_rows_received = 0
+    body_missing_uuid_rows = 0
+    body_duplicate_uuid_rows = 0
     normal_completion = False
     stop_reason = "resume_body_complete"
 
@@ -998,14 +1063,19 @@ def fetch_resume_full(
         )
         fetched_pages.add(page)
         body_pages_done += 1
+        uuid_diag = uuid_page_diagnostics(rows)
         new_n, refreshed_n = count_new_and_refreshed(rows, existing_uuid_set)
         if ok:
             received_rows.extend(rows)
             last_successful_body_page = page
+            body_new_uuid_count += new_n
+            body_uuid_rows_received += uuid_diag["uuid_rows"]
+            body_missing_uuid_rows += uuid_diag["missing_uuid_rows"]
+            body_duplicate_uuid_rows += uuid_diag["duplicate_uuid_on_page"]
         else:
             failed_pages.append(page)
             stop_reason = "page_fetch_failed"
-        log(phase_log_line("Resume Body", page, total_pages, len(rows), new_n, refreshed_n, None, None, status, elapsed_ms, retry_after, len(received_rows), body_pages_done, body_total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), None if ok else stop_reason, eta_remaining_pages=max(0, body_total_pages - page - 1)))
+        log(phase_log_line("Resume Body", page, total_pages, len(rows), new_n, refreshed_n, None, None, status, elapsed_ms, retry_after, len(received_rows), body_pages_done, body_total_pages, started_at, response_times_ms, status_counts, len(client.throttle_events), None if ok else stop_reason, eta_remaining_pages=max(0, body_total_pages - page - 1), uuid_rows=uuid_diag["uuid_rows"], missing_uuid_rows=uuid_diag["missing_uuid_rows"], duplicate_uuid_on_page=uuid_diag["duplicate_uuid_on_page"], total_new=body_new_uuid_count))
         if not ok:
             break
         if max_429_before_partial and len(client.throttle_events) >= max_429_before_partial:
@@ -1026,6 +1096,10 @@ def fetch_resume_full(
         "start_page": body_start_page,
         "pages_fetched": body_pages_done,
         "rows_received": sum(r.get("rows_returned") or 0 for r in page_audit),
+        "new_uuid_count": body_new_uuid_count,
+        "uuid_rows_received": body_uuid_rows_received,
+        "missing_uuid_rows": body_missing_uuid_rows,
+        "duplicate_uuid_rows": body_duplicate_uuid_rows,
         "last_successful_page": last_successful_body_page,
         "next_page_to_fetch": (last_successful_body_page + 1) if last_successful_body_page is not None else body_start_page,
         "stop_reason": stop_reason,
@@ -1116,6 +1190,12 @@ def fetch_resume_full(
 
     elapsed_total = time.monotonic() - started_at
     pages_ok = len([r for r in page_audit if r.get("ok")])
+    uuid_diag_totals = aggregate_uuid_diagnostics_from_audit(page_audit)
+    total_new_uuid_count = (
+        int((body_stats or {}).get("new_uuid_count") or 0)
+        + int((head_stats or {}).get("new_uuid_count") or 0)
+        + int((tail_stats or {}).get("new_uuid_count") or 0)
+    )
     full_normal_completion = bool(normal_completion and head_ok and tail_ok)
     resume_state_out = None if full_normal_completion else {
         "resume_mode": "resume_full",
@@ -1139,6 +1219,10 @@ def fetch_resume_full(
         "failed_pages": failed_pages,
         "failed_pages_count": len(failed_pages),
         "received_rows": len(received_rows),
+        "new_uuid_count": total_new_uuid_count,
+        "uuid_rows_received": uuid_diag_totals["uuid_rows_received"],
+        "missing_uuid_rows": uuid_diag_totals["missing_uuid_rows"],
+        "duplicate_uuid_rows": uuid_diag_totals["duplicate_uuid_rows"],
         "normal_completion": full_normal_completion,
         "stop_reason": "resume_full_complete" if full_normal_completion else stop_reason,
         "last_successful_page": last_successful_body_page,
@@ -1242,6 +1326,10 @@ def write_release_notes(path: Path, metadata: Dict[str, Any]) -> None:
         "",
         f"- Previous rows: `{metadata.get('merge', {}).get('previous_rows')}`",
         f"- Received rows this run: `{metadata.get('merge', {}).get('received_rows')}`",
+        f"- New UUIDs seen this run: `{metadata.get('new_uuid_count')}`",
+        f"- UUID rows received this run: `{metadata.get('uuid_rows_received')}`",
+        f"- Missing UUID rows this run: `{metadata.get('missing_uuid_rows')}`",
+        f"- Duplicate UUID rows this run: `{metadata.get('duplicate_uuid_rows')}`",
         f"- Inserted UUIDs: `{metadata.get('merge', {}).get('inserted_uuid_count')}`",
         f"- Refreshed UUIDs: `{metadata.get('merge', {}).get('refreshed_uuid_count')}`",
         f"- Retained UUIDs from previous latest: `{metadata.get('merge', {}).get('retained_uuid_count')}`",
@@ -1407,7 +1495,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     else:
         received_rows, page_audit, request_log, audit, normal_completion = fetch_full(
-            client, initial_data, initial_meta, extract_date, extract_ts,
+            client, initial_data, initial_meta, existing_uuid_set, extract_date, extract_ts,
             max_pages=args.max_pages,
             max_429_before_partial=args.max_429_before_partial,
             max_body_runtime_hours=args.max_body_runtime_hours,
@@ -1527,6 +1615,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "previous_db_found": str(existing_db) if existing_db else None,
         "previous_rows": len(existing_rows),
         "received_rows": len(received_rows),
+        "new_uuid_count": (audit or {}).get("new_uuid_count"),
+        "uuid_rows_received": (audit or {}).get("uuid_rows_received"),
+        "missing_uuid_rows": (audit or {}).get("missing_uuid_rows"),
+        "duplicate_uuid_rows": (audit or {}).get("duplicate_uuid_rows"),
         "normal_completion": normal_completion,
         "initial_page": initial_meta,
         "audit": audit,
@@ -1576,6 +1668,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "api_total_elements": api_total_elements,
         "row_count": row_count,
         "received_rows": len(received_rows),
+        "new_uuid_count": metadata.get("new_uuid_count"),
+        "uuid_rows_received": metadata.get("uuid_rows_received"),
+        "missing_uuid_rows": metadata.get("missing_uuid_rows"),
+        "duplicate_uuid_rows": metadata.get("duplicate_uuid_rows"),
         "previous_rows": len(existing_rows),
         "merge": merge_stats,
         "phases": metadata.get("phases"),
