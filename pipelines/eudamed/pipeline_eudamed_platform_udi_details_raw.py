@@ -3,7 +3,7 @@
 """
 EUDAMED Platform UDI Details Raw acquisition pipeline.
 
-Pipeline version: v1.0.0
+Pipeline version: v1.0.1
 
 Scope
 -----
@@ -58,7 +58,7 @@ import duckdb
 import pandas as pd
 import requests
 
-PIPELINE_VERSION = "v1.0.0"
+PIPELINE_VERSION = "v1.0.1"
 BASE_URL_DEFAULT = "https://ec.europa.eu/tools/eudamed/api"
 UDI_DETAILS_ENDPOINT_TEMPLATE = "/devices/udiDiData/{uuid}"
 CROCKFORD32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -710,8 +710,8 @@ def runtime_exceeded(started_at: float, max_runtime_hours: float) -> bool:
     return bool(max_runtime_hours and max_runtime_hours > 0 and ((time.monotonic() - started_at) / 3600.0) >= max_runtime_hours)
 
 
-def fetch_details(client: EudamedClient, queue_rows: List[Dict[str, Any]], extract_date: str, extract_ts: str, mode: str, max_records: int, max_runtime_hours: float, max_429_before_partial: int, log_every_records: int, existing_detail_uuid_set: Optional[set] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], bool]:
-    total = len([q for q in queue_rows if q.get("status") in {QUEUE_PENDING, QUEUE_FAILED}])
+def fetch_details(client: EudamedClient, queue_rows: List[Dict[str, Any]], extract_date: str, extract_ts: str, mode: str, max_records: int, max_runtime_hours: float, max_429_before_partial: int, max_failed_records: int, log_every_records: int, existing_detail_uuid_set: Optional[set] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], bool]:
+    total = len([q for q in queue_rows if q.get("status") == QUEUE_PENDING])
     rows: List[Dict[str, Any]] = []
     request_log: List[Dict[str, Any]] = []
     started_at = time.monotonic()
@@ -723,7 +723,7 @@ def fetch_details(client: EudamedClient, queue_rows: List[Dict[str, Any]], extra
     normal_completion = True
     stop_reason = "all_queue_items_fetched"
     last_successful_uuid = None
-    pending_indices = [i for i, q in enumerate(queue_rows) if q.get("status") in {QUEUE_PENDING, QUEUE_FAILED}]
+    pending_indices = [i for i, q in enumerate(queue_rows) if q.get("status") == QUEUE_PENDING]
     log(f"=== UDI Details fetch mode={mode} pending_queue={total} ===")
     for pos, qidx in enumerate(pending_indices):
         if max_records and max_records > 0 and processed >= max_records:
@@ -759,10 +759,12 @@ def fetch_details(client: EudamedClient, queue_rows: List[Dict[str, Any]], extra
         else:
             fail_count += 1
             q["status"] = QUEUE_FAILED
-            normal_completion = False
-            stop_reason = "detail_fetch_failed"
-            log(f"WARNING detail fetch failed uuid={uuid} status={status} error={error}")
-            break
+            q["completed_at_utc"] = None
+            log(f"WARNING detail fetch failed uuid={uuid} status={status} error={error}; marking queue item as failed and continuing")
+            if max_failed_records and max_failed_records > 0 and fail_count >= max_failed_records:
+                normal_completion = False
+                stop_reason = "failed_records_limit"
+                break
         if max_429_before_partial and len(client.throttle_events) >= max_429_before_partial:
             normal_completion = False
             stop_reason = "429_limit"
@@ -770,8 +772,8 @@ def fetch_details(client: EudamedClient, queue_rows: List[Dict[str, Any]], extra
         if processed == 1 or processed % max(1, log_every_records) == 0 or pos == len(pending_indices) - 1:
             log(progress_line(mode, processed, total, ok_count, fail_count, started_at, response_ms, len(client.throttle_events), total_new, total_refreshed, batch_new, batch_refreshed))
             batch_new = batch_refreshed = 0
-    remaining_pending = sum(1 for q in queue_rows if q.get("status") in {QUEUE_PENDING, QUEUE_FAILED})
-    if remaining_pending == 0 and fail_count == 0:
+    remaining_pending = sum(1 for q in queue_rows if q.get("status") == QUEUE_PENDING)
+    if remaining_pending == 0 and stop_reason not in {"max_records_cap_reached", "runtime_limit", "429_limit", "failed_records_limit"}:
         normal_completion = True
         stop_reason = "all_queue_items_fetched"
     audit = {
@@ -942,6 +944,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--retries", type=int, default=4)
     p.add_argument("--backoff", type=float, default=1.5)
     p.add_argument("--max-429-before-partial", type=int, default=7)
+    p.add_argument("--max-failed-records", type=int, default=100, help="Controlled PARTIAL stop after this many failed detail records. 0 = never stop for failed records")
     p.add_argument("--max-runtime-hours", type=float, default=5.5)
     p.add_argument("--log-every-records", type=int, default=100)
     p.add_argument("--release-timestamp", default=None)
@@ -984,7 +987,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.mode.startswith("resume_") and previous_queue and queue_compatible(previous_metadata, args.mode):
         queue_rows = previous_queue
         candidate_stats = previous_metadata.get("candidate_stats") or {"base_mode": base_mode, "candidate_count": len(queue_rows)}
-        log(f"Compatible previous queue found for resume. pending={sum(1 for q in queue_rows if q.get('status') in {QUEUE_PENDING, QUEUE_FAILED}):,}")
+        log(f"Compatible previous queue found for resume. pending={sum(1 for q in queue_rows if q.get('status') == QUEUE_PENDING):,}")
     else:
         if args.mode.startswith("resume_"):
             log("No compatible previous queue found. Rebuilding queue from selected base mode.")
@@ -995,10 +998,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     client = EudamedClient(args.base_url, args.language, args.timeout, args.retries, args.backoff, args.max_rps)
     received_rows, request_log, queue_rows, audit, normal_completion = fetch_details(
         client, queue_rows, extract_date, extract_ts, base_mode, args.max_records, args.max_runtime_hours,
-        args.max_429_before_partial, args.log_every_records, {r.get("uuid") for r in previous_rows if r.get("uuid")},
+        args.max_429_before_partial, args.max_failed_records, args.log_every_records, {r.get("uuid") for r in previous_rows if r.get("uuid")},
     )
 
-    if len(received_rows) == 0 and len(queue_rows) > 0 and not normal_completion:
+    if len(received_rows) == 0 and len(previous_rows) == 0 and len(queue_rows) > 0 and not normal_completion and audit.get("stop_reason") not in {"runtime_limit", "max_records_cap_reached", "failed_records_limit", "429_limit"}:
         run_status = RUN_FAILED
     elif not previous_rows and normal_completion:
         run_status = RUN_BOOTSTRAP
@@ -1020,7 +1023,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     metadata = {
         "pipeline_version": PIPELINE_VERSION, "release_timestamp": rel_ts, "release_time_utc": release_title_time(rel_ts), "generated_at_utc": iso_utc_now(),
         "run_status": run_status, "requested_mode": args.mode, "effective_mode": base_mode, "base_url": args.base_url, "language": args.language,
-        "max_records": args.max_records, "max_rps": args.max_rps, "max_429_before_partial": args.max_429_before_partial, "max_runtime_hours": args.max_runtime_hours,
+        "max_records": args.max_records, "max_rps": args.max_rps, "max_429_before_partial": args.max_429_before_partial, "max_failed_records": args.max_failed_records, "max_runtime_hours": args.max_runtime_hours,
         "log_every_records": args.log_every_records, "retries": args.retries, "udi_raw_db_found": str(raw_db), "previous_detail_db_found": str(existing_db) if existing_db else None,
         "candidate_stats": candidate_stats, "row_count": len(merged_rows), "distinct_uuid_count": len({r.get('uuid') for r in merged_rows if r.get('uuid')}),
         "distinct_primary_di_count": len({r.get('primary_di_code') for r in merged_rows if r.get('primary_di_code')}), "distinct_ulid_count": len({r.get('ulid') for r in merged_rows if r.get('ulid')}),
