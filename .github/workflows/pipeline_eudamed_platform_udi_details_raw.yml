@@ -37,6 +37,10 @@ on:
         description: "Controlled PARTIAL stop after this many 429 events"
         required: false
         default: "7"
+      max_failed_records:
+        description: "Controlled PARTIAL stop after this many failed detail records. 0 = never stop for failed records"
+        required: false
+        default: "100"
       max_runtime_hours:
         description: "Controlled PARTIAL stop after runtime limit in hours. 0 = disabled"
         required: false
@@ -128,6 +132,7 @@ jobs:
             --max-records "${{ github.event.inputs.max_records || '0' }}" \
             --log-every-records "${{ github.event.inputs.log_every_records || '100' }}" \
             --max-429-before-partial "${{ github.event.inputs.max_429_before_partial || '7' }}" \
+            --max-failed-records "${{ github.event.inputs.max_failed_records || '100' }}" \
             --max-runtime-hours "${{ github.event.inputs.max_runtime_hours || '5.5' }}" \
             $EXTRA_ARGS
 
